@@ -1,5 +1,6 @@
 use crate::config::{
-    now_unix_ms, sync_cosmic_background_file, DaemonState, IpcCommand, OrderMode, SlideshowConfig,
+    current_cosmic_wallpaper, now_unix_ms, sync_cosmic_background_file, DaemonState, IpcCommand,
+    OrderMode, SlideshowConfig,
 };
 use crate::wayland::{DecodedWallpaper, WaylandRenderer};
 use anyhow::{Context, Result};
@@ -167,6 +168,21 @@ pub fn send_ipc_command(cmd: &IpcCommand) -> Result<()> {
     Ok(())
 }
 
+pub fn stop_daemon() -> Result<()> {
+    if send_ipc_command(&IpcCommand::Stop).is_ok() {
+        return Ok(());
+    }
+    if let Some(state) = DaemonState::load() {
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg(state.pid.to_string())
+            .status();
+    }
+    let _ = fs::remove_file(DaemonState::socket_path());
+    let _ = fs::remove_file(DaemonState::state_path());
+    Ok(())
+}
+
 pub fn is_daemon_running() -> bool {
     DaemonState::load().is_some()
 }
@@ -257,16 +273,24 @@ fn apply_wallpaper(
     if let Some(wl) = renderer.as_mut() {
         match DecodedWallpaper::load(path) {
             Ok(decoded) => {
-                if let Err(err) = wl.transition_to(decoded, config.scaling_mode, fade_secs) {
+                if let Err(err) = wl.transition_to(
+                    path,
+                    decoded,
+                    config.scaling_mode,
+                    fade_secs,
+                    config.sync_cosmic_config,
+                ) {
                     eprintln!("Wayland transition error: {err:#}");
+                    if config.sync_cosmic_config {
+                        sync_cosmic_background_file(path, config.scaling_mode);
+                    }
                 }
             }
             Err(err) => {
                 eprintln!("Failed to decode image {}: {err:#}", path.display());
             }
         }
-    }
-    if config.sync_cosmic_config {
+    } else if config.sync_cosmic_config {
         sync_cosmic_background_file(path, config.scaling_mode);
     }
 }
@@ -286,18 +310,20 @@ pub fn run_daemon() -> Result<()> {
     listener.set_nonblocking(true)?;
 
     let mut config = SlideshowConfig::load();
-    let mut renderer = match WaylandRenderer::new(config.scaling_mode) {
-        Ok(r) => Some(r),
-        Err(err) => {
-            eprintln!(
-                "Wayland LayerShell unavailable ({err:#}), falling back to COSMIC config sync"
-            );
-            None
-        }
-    };
+    let existing_cosmic_wp = current_cosmic_wallpaper();
+    let mut renderer =
+        match WaylandRenderer::new(config.scaling_mode, existing_cosmic_wp.as_deref()) {
+            Ok(r) => Some(r),
+            Err(err) => {
+                eprintln!(
+                    "Wayland LayerShell unavailable ({err:#}), falling back to COSMIC config sync"
+                );
+                None
+            }
+        };
 
     let backend_info = if renderer.is_some() {
-        "Wayland Layer-Shell (60 FPS Crossfade)".to_string()
+        "Transient Crossfade + COSMIC Hand-off (Zero Idle Overlay)".to_string()
     } else {
         "COSMIC Config Sync".to_string()
     };
@@ -307,8 +333,8 @@ pub fn run_daemon() -> Result<()> {
         pid: std::process::id(),
         running: true,
         paused: config.paused,
-        current_wallpaper: None,
-        next_wallpaper: None,
+        current_wallpaper: existing_cosmic_wp.clone(),
+        next_wallpaper: playlist.planned_next.clone(),
         cycle_started_unix_ms: now_unix_ms(),
         cycle_duration_ms: 0,
         active_rotation_count: playlist.enabled.len(),
@@ -317,16 +343,19 @@ pub fn run_daemon() -> Result<()> {
         updated_unix_ms: now_unix_ms(),
     };
 
-    // Perform initial wallpaper setup immediately
-    if let Some(first_wp) = playlist.advance_next() {
-        state.transitioning = true;
-        state.current_wallpaper = Some(first_wp.clone());
-        state.next_wallpaper = playlist.planned_next.clone();
-        state.save();
+    // Perform initial wallpaper setup if not paused (or if no existing wallpaper was set)
+    if !config.paused || existing_cosmic_wp.is_none() {
+        if let Some(first_wp) = playlist.advance_next() {
+            state.transitioning = true;
+            state.current_wallpaper = Some(first_wp.clone());
+            state.next_wallpaper = playlist.planned_next.clone();
+            state.save();
 
-        // First frame fast fade (0.4s) so startup feels responsive
-        apply_wallpaper(&mut renderer, &first_wp, &config, 0.4);
-        state.transitioning = false;
+            apply_wallpaper(&mut renderer, &first_wp, &config, config.fade_duration_secs);
+            state.transitioning = false;
+        }
+    } else if let Some(existing) = existing_cosmic_wp {
+        playlist.force_current(existing);
     }
 
     let mut cycle_start = Instant::now();
@@ -498,7 +527,7 @@ pub fn run_daemon() -> Result<()> {
                 state.cycle_duration_ms = current_target_duration.as_millis() as u64;
             } else if scaling_changed {
                 if let Some(curr) = state.current_wallpaper.clone() {
-                    apply_wallpaper(&mut renderer, &curr, &config, 0.25);
+                    sync_cosmic_background_file(&curr, config.scaling_mode);
                 }
             }
 

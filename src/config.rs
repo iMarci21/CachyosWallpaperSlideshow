@@ -266,6 +266,26 @@ pub fn collect_images_from_dir(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+pub fn current_cosmic_wallpaper() -> Option<PathBuf> {
+    let config_dir = dirs::config_dir()?;
+    let all_bg_path = config_dir
+        .join("cosmic")
+        .join("com.system76.CosmicBackground")
+        .join("v1")
+        .join("all");
+
+    let content = fs::read_to_string(&all_bg_path).ok()?;
+    let start = content.find("Path(\"")?;
+    let rest = &content[start + 6..];
+    let end = rest.find("\")")?;
+    let p = PathBuf::from(&rest[..end]);
+    if is_supported_image(&p) {
+        Some(p)
+    } else {
+        None
+    }
+}
+
 pub fn discover_cosmic_wallpapers() -> Vec<PathBuf> {
     let mut found = Vec::new();
     let Some(config_dir) = dirs::config_dir() else {
@@ -292,21 +312,9 @@ pub fn discover_cosmic_wallpapers() -> Vec<PathBuf> {
     }
 
     // 2. Check com.system76.CosmicBackground/v1/all
-    let all_bg_path = config_dir
-        .join("cosmic")
-        .join("com.system76.CosmicBackground")
-        .join("v1")
-        .join("all");
-
-    if let Ok(content) = fs::read_to_string(&all_bg_path) {
-        if let Some(start) = content.find("Path(\"") {
-            let rest = &content[start + 6..];
-            if let Some(end) = rest.find("\")") {
-                let p = PathBuf::from(&rest[..end]);
-                if is_supported_image(&p) && !found.contains(&p) {
-                    found.push(p);
-                }
-            }
+    if let Some(p) = current_cosmic_wallpaper() {
+        if !found.contains(&p) {
+            found.push(p);
         }
     }
 
@@ -410,7 +418,9 @@ impl DaemonState {
             return 0.0;
         }
         let now = now_unix_ms();
-        let end = self.cycle_started_unix_ms.saturating_add(self.cycle_duration_ms);
+        let end = self
+            .cycle_started_unix_ms
+            .saturating_add(self.cycle_duration_ms);
         if now >= end {
             0.0
         } else {

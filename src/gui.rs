@@ -4,7 +4,7 @@ use crate::config::{
 };
 use crate::daemon::{
     is_daemon_running, is_systemd_autostart_enabled, send_ipc_command, set_systemd_autostart,
-    spawn_daemon_background,
+    spawn_daemon_background, stop_daemon,
 };
 use eframe::egui::{
     self, Color32, CornerRadius, FontId, RichText, Sense, Stroke, TextureHandle, TextureOptions,
@@ -219,7 +219,7 @@ impl SlideshowApp {
         }
     }
 
-    fn render_top_bar(&mut self, ui: &mut egui::Ui) {
+    fn render_top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.heading(
                 RichText::new("🖼 CachyOS Wallpaper Slideshow")
@@ -260,6 +260,25 @@ impl SlideshowApp {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let stop_quit_btn = egui::Button::new(
+                    RichText::new("⏹ Stop Daemon & Quit")
+                        .strong()
+                        .color(Color32::from_rgb(255, 225, 225)),
+                )
+                .fill(Color32::from_rgb(135, 38, 48));
+
+                if ui
+                    .add(stop_quit_btn)
+                    .on_hover_text(
+                        "Completely stop the background slideshow daemon and close this window",
+                    )
+                    .clicked()
+                {
+                    let _ = stop_daemon();
+                    self.daemon_state = None;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+
                 let unsaved = self.has_unsaved_changes();
                 let save_btn = egui::Button::new(
                     RichText::new(if unsaved {
@@ -366,7 +385,7 @@ impl SlideshowApp {
                         );
 
                         ui.add_space(8.0);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("⏮ Prev").clicked() {
                                 let _ = send_ipc_command(&IpcCommand::Prev);
                             }
@@ -393,6 +412,26 @@ impl SlideshowApp {
                                 let _ = send_ipc_command(&IpcCommand::Next);
                             }
                         });
+
+                        ui.add_space(6.0);
+                        let stop_btn = egui::Button::new(
+                            RichText::new("⏹ Stop & Exit Background Daemon")
+                                .color(Color32::from_rgb(255, 195, 195))
+                                .strong(),
+                        )
+                        .fill(Color32::from_rgb(95, 32, 40));
+
+                        if ui
+                            .add_sized([ui.available_width(), 28.0], stop_btn)
+                            .on_hover_text(
+                                "Completely shut down the background slideshow daemon process",
+                            )
+                            .clicked()
+                        {
+                            let _ = stop_daemon();
+                            self.daemon_state = None;
+                            self.show_toast("Background daemon stopped completely");
+                        }
                     } else {
                         ui.label(
                             RichText::new("Background daemon is currently stopped.")
@@ -1052,7 +1091,7 @@ impl eframe::App for SlideshowApp {
                     .inner_margin(egui::Margin::symmetric(16, 10)),
             )
             .show(ctx, |ui| {
-                self.render_top_bar(ui);
+                self.render_top_bar(ui, ctx);
             });
 
         egui::SidePanel::left("controls_sidebar")

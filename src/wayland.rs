@@ -1,4 +1,4 @@
-use crate::config::ScalingMode;
+use crate::config::{sync_cosmic_background_file, ScalingMode};
 use anyhow::{Context, Result};
 use image::{DynamicImage, GenericImageView, RgbaImage};
 use rayon::prelude::*;
@@ -28,6 +28,7 @@ use wayland_client::{
 };
 
 /// Pre-decoded RGBA image in memory so multi-output scaling is fast.
+#[derive(Clone)]
 pub struct DecodedWallpaper {
     pub image: Arc<DynamicImage>,
 }
@@ -141,32 +142,31 @@ struct OutputSurface {
     width: u32,
     height: u32,
     configured: bool,
-    prev_buffer: Vec<u8>,
-    current_buffer: Vec<u8>,
-    needs_redraw: bool,
+    from_buffer: Vec<u8>,
+    to_buffer: Vec<u8>,
 }
 
 impl OutputSurface {
-    fn rescale_current(&mut self, wp: &DecodedWallpaper, mode: ScalingMode) {
+    fn prepare_buffers(
+        &mut self,
+        from_wp: &DecodedWallpaper,
+        to_wp: &DecodedWallpaper,
+        mode: ScalingMode,
+    ) {
         if self.width == 0 || self.height == 0 {
             return;
         }
-        let scaled = wp.scale_to_xrgb8888(self.width, self.height, mode);
-        if self.current_buffer.len() == scaled.len() {
-            self.prev_buffer = std::mem::replace(&mut self.current_buffer, scaled);
-        } else {
-            self.prev_buffer = scaled.clone();
-            self.current_buffer = scaled;
-        }
+        self.from_buffer = from_wp.scale_to_xrgb8888(self.width, self.height, mode);
+        self.to_buffer = to_wp.scale_to_xrgb8888(self.width, self.height, mode);
     }
 
-    fn draw_frame(&mut self, blend_progress: Option<f32>) -> Result<()> {
+    fn draw_frame(&mut self, blend_progress: f32) -> Result<()> {
         if !self.configured || self.width == 0 || self.height == 0 {
             return Ok(());
         }
         let stride = self.width as i32 * 4;
         let byte_len = (self.width * self.height * 4) as usize;
-        if self.current_buffer.len() != byte_len {
+        if self.to_buffer.len() != byte_len {
             return Ok(());
         }
 
@@ -180,19 +180,15 @@ impl OutputSurface {
             )
             .context("Failed to allocate SHM buffer")?;
 
-        if let Some(progress) = blend_progress {
-            if self.prev_buffer.len() == byte_len {
-                blend_xrgb8888(
-                    &self.prev_buffer,
-                    &self.current_buffer,
-                    &mut canvas[..byte_len],
-                    progress,
-                );
-            } else {
-                canvas[..byte_len].copy_from_slice(&self.current_buffer);
-            }
+        if self.from_buffer.len() == byte_len {
+            blend_xrgb8888(
+                &self.from_buffer,
+                &self.to_buffer,
+                &mut canvas[..byte_len],
+                blend_progress,
+            );
         } else {
-            canvas[..byte_len].copy_from_slice(&self.current_buffer);
+            canvas[..byte_len].copy_from_slice(&self.to_buffer);
         }
 
         let wl_surf = self.layer_surface.wl_surface();
@@ -201,7 +197,6 @@ impl OutputSurface {
             .context("Failed to attach SHM buffer to layer surface")?;
         wl_surf.damage_buffer(0, 0, self.width as i32, self.height as i32);
         wl_surf.commit();
-        self.needs_redraw = false;
         Ok(())
     }
 }
@@ -213,7 +208,8 @@ pub struct WaylandLayerState {
     shm_state: Shm,
     layer_shell: LayerShell,
     surfaces: HashMap<u32, OutputSurface>,
-    active_wallpaper: Option<DecodedWallpaper>,
+    from_wallpaper: Option<DecodedWallpaper>,
+    to_wallpaper: Option<DecodedWallpaper>,
     scaling_mode: ScalingMode,
 }
 
@@ -228,7 +224,7 @@ impl WaylandLayerState {
         }
 
         let surface = self.compositor_state.create_surface(qh);
-        // Empty input region so clicks pass straight through if needed
+        // Empty input region so clicks pass straight through
         if let Ok(region) = smithay_client_toolkit::compositor::Region::new(&self.compositor_state)
         {
             surface.set_input_region(Some(region.wl_region()));
@@ -238,7 +234,7 @@ impl WaylandLayerState {
             qh,
             surface,
             Layer::Background,
-            Some("cachyos-wallpaper-slideshow"),
+            Some("cachyos-wallpaper-crossfade"),
             Some(&output),
         );
         layer_surface.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
@@ -260,11 +256,24 @@ impl WaylandLayerState {
                 width: 0,
                 height: 0,
                 configured: false,
-                prev_buffer: Vec::new(),
-                current_buffer: Vec::new(),
-                needs_redraw: false,
+                from_buffer: Vec::new(),
+                to_buffer: Vec::new(),
             },
         );
+    }
+
+    fn spawn_all_output_surfaces(&mut self, qh: &QueueHandle<Self>) {
+        let outputs: Vec<_> = self.output_state.outputs().collect();
+        for output in outputs {
+            self.create_surface_for_output(qh, output);
+        }
+    }
+
+    fn destroy_all_output_surfaces(&mut self) {
+        // Dropping `OutputSurface` drops `LayerSurface` and `SlotPool`,
+        // cleanly unmapping and destroying the Wayland layer surfaces so zero
+        // surfaces exist when the slideshow is idle or paused!
+        self.surfaces.clear();
     }
 }
 
@@ -323,19 +332,17 @@ impl OutputHandler for WaylandLayerState {
     fn new_output(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        output: wl_output::WlOutput,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
     ) {
-        self.create_surface_for_output(qh, output);
     }
 
     fn update_output(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        output: wl_output::WlOutput,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
     ) {
-        self.create_surface_for_output(qh, output);
     }
 
     fn output_destroyed(
@@ -364,21 +371,18 @@ impl LayerShellHandler for WaylandLayerState {
         let new_w = configure.new_size.0.max(1);
         let new_h = configure.new_size.1.max(1);
         let mode = self.scaling_mode;
-        let active_wp = self.active_wallpaper.as_ref();
+        let from_wp = self.from_wallpaper.as_ref();
+        let to_wp = self.to_wallpaper.as_ref();
 
         for surf in self.surfaces.values_mut() {
             if &surf.layer_surface == layer {
-                let size_changed = surf.width != new_w || surf.height != new_h;
                 surf.width = new_w;
                 surf.height = new_h;
                 surf.configured = true;
-                if size_changed || surf.current_buffer.is_empty() {
-                    if let Some(wp) = active_wp {
-                        surf.rescale_current(wp, mode);
-                        surf.prev_buffer = surf.current_buffer.clone();
-                    }
+                if let (Some(f_wp), Some(t_wp)) = (from_wp, to_wp) {
+                    surf.prepare_buffers(f_wp, t_wp, mode);
+                    let _ = surf.draw_frame(0.0);
                 }
-                let _ = surf.draw_frame(None);
                 break;
             }
         }
@@ -411,7 +415,7 @@ pub struct WaylandRenderer {
 }
 
 impl WaylandRenderer {
-    pub fn new(initial_scaling: ScalingMode) -> Result<Self> {
+    pub fn new(initial_scaling: ScalingMode, initial_wallpaper: Option<&Path>) -> Result<Self> {
         let conn = Connection::connect_to_env().context("Failed to connect to Wayland display")?;
         let (globals, mut event_queue) =
             registry_queue_init(&conn).context("Failed to initialize Wayland registry")?;
@@ -425,6 +429,8 @@ impl WaylandRenderer {
         let output_state = OutputState::new(&globals, &qh);
         let registry_state = RegistryState::new(&globals);
 
+        let from_wallpaper = initial_wallpaper.and_then(|p| DecodedWallpaper::load(p).ok());
+
         let mut state = WaylandLayerState {
             registry_state,
             compositor_state,
@@ -432,16 +438,12 @@ impl WaylandRenderer {
             shm_state,
             layer_shell,
             surfaces: HashMap::new(),
-            active_wallpaper: None,
+            from_wallpaper,
+            to_wallpaper: None,
             scaling_mode: initial_scaling,
         };
 
-        // Roundtrip to discover outputs and configure layer surfaces
-        event_queue.roundtrip(&mut state)?;
-        let outputs: Vec<_> = state.output_state.outputs().collect();
-        for output in outputs {
-            state.create_surface_for_output(&qh, output);
-        }
+        // Roundtrip only to discover outputs; do NOT create persistent surfaces while idle!
         event_queue.roundtrip(&mut state)?;
 
         Ok(Self {
@@ -461,34 +463,47 @@ impl WaylandRenderer {
         Ok(())
     }
 
-    /// Performs a smooth 60 FPS crossfade to the new wallpaper across all Wayland outputs.
+    /// Performs a smooth 60 FPS crossfade using temporary Wayland Layer-Shell surfaces,
+    /// syncs the final wallpaper to `cosmic-bg`, and then destroys the temporary surfaces
+    /// so zero competing surfaces exist while idle/paused.
     pub fn transition_to(
         &mut self,
+        target_path: &Path,
         wallpaper: DecodedWallpaper,
         scaling_mode: ScalingMode,
         fade_duration_secs: f32,
+        sync_cosmic: bool,
     ) -> Result<()> {
         self.dispatch_pending()?;
         self.state.scaling_mode = scaling_mode;
 
-        let had_previous = self.state.active_wallpaper.is_some();
-
-        for surf in self.state.surfaces.values_mut() {
-            if surf.configured && surf.width > 0 && surf.height > 0 {
-                surf.rescale_current(&wallpaper, scaling_mode);
+        let Some(prev_wp) = self.state.from_wallpaper.clone() else {
+            // No previous image to crossfade from; hand directly to cosmic-bg
+            if sync_cosmic {
+                sync_cosmic_background_file(target_path, scaling_mode);
             }
-        }
-        self.state.active_wallpaper = Some(wallpaper);
+            self.state.from_wallpaper = Some(wallpaper);
+            return Ok(());
+        };
 
-        if !had_previous || fade_duration_secs <= 0.05 {
-            for surf in self.state.surfaces.values_mut() {
-                surf.prev_buffer = surf.current_buffer.clone();
-                let _ = surf.draw_frame(None);
+        if fade_duration_secs <= 0.05 {
+            if sync_cosmic {
+                sync_cosmic_background_file(target_path, scaling_mode);
             }
-            self.conn.flush()?;
+            self.state.from_wallpaper = Some(wallpaper);
             return Ok(());
         }
 
+        // 1. Create temporary layer surfaces for the duration of the crossfade
+        self.state.from_wallpaper = Some(prev_wp);
+        self.state.to_wallpaper = Some(wallpaper.clone());
+
+        let qh = self.event_queue.handle();
+        self.state.spawn_all_output_surfaces(&qh);
+        // Roundtrip so compositor configures the layer surfaces and draws frame 0.0 (the old wallpaper)
+        self.event_queue.roundtrip(&mut self.state)?;
+
+        // 2. Animate smoothstep crossfade at 60 FPS
         let duration = Duration::from_secs_f32(fade_duration_secs.clamp(0.05, 10.0));
         let frame_step = Duration::from_micros(16_667); // ~60 FPS
         let start = Instant::now();
@@ -500,7 +515,7 @@ impl WaylandRenderer {
             }
             let progress = (elapsed.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0);
             for surf in self.state.surfaces.values_mut() {
-                let _ = surf.draw_frame(Some(progress));
+                let _ = surf.draw_frame(progress);
             }
             self.conn.flush()?;
             self.event_queue.dispatch_pending(&mut self.state)?;
@@ -511,12 +526,26 @@ impl WaylandRenderer {
             }
         }
 
-        // Commit final crisp 100% frame
+        // 3. Commit 100% final frame on our overlay
         for surf in self.state.surfaces.values_mut() {
-            surf.prev_buffer = surf.current_buffer.clone();
-            let _ = surf.draw_frame(None);
+            let _ = surf.draw_frame(1.0);
         }
         self.conn.flush()?;
+
+        // 4. Update cosmic-bg underneath while our 100% frame covers the transition seamlessly
+        if sync_cosmic {
+            sync_cosmic_background_file(target_path, scaling_mode);
+            // Give cosmic-bg a brief moment to load and commit the new image underneath
+            std::thread::sleep(Duration::from_millis(180));
+        }
+
+        // 5. Destroy our temporary overlay surfaces so cosmic-bg owns the static background alone!
+        self.state.destroy_all_output_surfaces();
+        self.state.to_wallpaper = None;
+        self.state.from_wallpaper = Some(wallpaper);
+        self.conn.flush()?;
+        self.event_queue.roundtrip(&mut self.state)?;
+
         Ok(())
     }
 }

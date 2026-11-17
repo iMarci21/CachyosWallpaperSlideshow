@@ -65,7 +65,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Stop => {
-            let _ = daemon::send_ipc_command(&IpcCommand::Stop);
+            daemon::stop_daemon()?;
+            println!("Stopped cachyos-wallpaper-slideshow daemon.");
             Ok(())
         }
         Commands::Status => {
