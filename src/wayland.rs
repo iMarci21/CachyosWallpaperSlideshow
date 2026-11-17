@@ -1,4 +1,7 @@
-use crate::config::{sync_cosmic_background_file, ScalingMode};
+use crate::config::{
+    cosmic_bg_state_wallpapers_path, sync_cosmic_background_file, wait_for_cosmic_bg_commit,
+    ScalingMode,
+};
 use anyhow::{Context, Result};
 use image::{DynamicImage, GenericImageView, RgbaImage};
 use rayon::prelude::*;
@@ -18,6 +21,7 @@ use smithay_client_toolkit::{
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -224,16 +228,21 @@ impl WaylandLayerState {
         }
 
         let surface = self.compositor_state.create_surface(qh);
-        // Empty input region so clicks pass straight through
+        // Empty input region so mouse clicks/scrolls pass straight through
         if let Ok(region) = smithay_client_toolkit::compositor::Region::new(&self.compositor_state)
         {
             surface.set_input_region(Some(region.wl_region()));
         }
 
+        // IMPORTANT: Use `Layer::Bottom` instead of `Layer::Background`!
+        // In zwlr_layer_shell_v1, `Layer::Bottom` sits strictly ABOVE `Layer::Background` (`cosmic-bg`)
+        // and strictly BELOW all normal application windows and panels (`Layer::Top`).
+        // This guarantees that when `cosmic-bg` finishes loading/committing on `Layer::Background`,
+        // it can NEVER jump in front of our crossfade animation and cut off a 2.5s fade!
         let layer_surface = self.layer_shell.create_layer_surface(
             qh,
             surface,
-            Layer::Background,
+            Layer::Bottom,
             Some("cachyos-wallpaper-crossfade"),
             Some(&output),
         );
@@ -463,9 +472,10 @@ impl WaylandRenderer {
         Ok(())
     }
 
-    /// Performs a smooth 60 FPS crossfade using temporary Wayland Layer-Shell surfaces,
-    /// syncs the final wallpaper to `cosmic-bg`, and then destroys the temporary surfaces
-    /// so zero competing surfaces exist while idle/paused.
+    /// Performs a smooth 60 FPS crossfade on `Layer::Bottom` (strictly above `cosmic-bg`'s
+    /// `Layer::Background` and strictly below all windows), triggers `cosmic-bg` underneath
+    /// at the start of the fade so `cosmic-bg` can never jump in front of our animation,
+    /// holds the 100% frame until `cosmic-bg` finishes committing, and then unmaps cleanly.
     pub fn transition_to(
         &mut self,
         target_path: &Path,
@@ -494,16 +504,29 @@ impl WaylandRenderer {
             return Ok(());
         }
 
-        // 1. Create temporary layer surfaces for the duration of the crossfade
+        // 1. Create temporary `Layer::Bottom` surfaces and cover `Layer::Background` with frame 0.0
         self.state.from_wallpaper = Some(prev_wp);
         self.state.to_wallpaper = Some(wallpaper.clone());
 
         let qh = self.event_queue.handle();
         self.state.spawn_all_output_surfaces(&qh);
-        // Roundtrip so compositor configures the layer surfaces and draws frame 0.0 (the old wallpaper)
+        // First roundtrip receives LayerSurface::configure and commits frame 0.0
+        self.event_queue.roundtrip(&mut self.state)?;
+        // Second roundtrip ensures cosmic-comp has latched our opaque frame 0.0 buffer on Layer::Bottom
         self.event_queue.roundtrip(&mut self.state)?;
 
-        // 2. Animate smoothstep crossfade at 60 FPS
+        // 2. Record `cosmic-bg` state file mtime and trigger `cosmic-bg` reload underneath our
+        //    `Layer::Bottom` surface. Because `Layer::Bottom` is strictly above `Layer::Background`,
+        //    `cosmic-bg` will never appear on top of our crossfade even if it finishes in 0.7s!
+        let prev_state_mtime = cosmic_bg_state_wallpapers_path()
+            .and_then(|p| fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
+
+        if sync_cosmic {
+            sync_cosmic_background_file(target_path, scaling_mode);
+        }
+
+        // 3. Animate smoothstep crossfade at 60 FPS for the full requested duration (e.g. 2.5s)
         let duration = Duration::from_secs_f32(fade_duration_secs.clamp(0.05, 10.0));
         let frame_step = Duration::from_micros(16_667); // ~60 FPS
         let start = Instant::now();
@@ -526,20 +549,21 @@ impl WaylandRenderer {
             }
         }
 
-        // 3. Commit 100% final frame on our overlay
+        // 4. Commit 100% final frame on our `Layer::Bottom` overlay
         for surf in self.state.surfaces.values_mut() {
             let _ = surf.draw_frame(1.0);
         }
         self.conn.flush()?;
+        self.event_queue.roundtrip(&mut self.state)?;
 
-        // 4. Update cosmic-bg underneath while our 100% frame covers the transition seamlessly
+        // 5. If the user chose a very short crossfade (e.g. < 0.5s), `cosmic-bg` might still be
+        //    decoding underneath on `Layer::Background`. Hold our 100% `Layer::Bottom` frame
+        //    until `cosmic-bg` has finished updating its state file and settled!
         if sync_cosmic {
-            sync_cosmic_background_file(target_path, scaling_mode);
-            // Give cosmic-bg a brief moment to load and commit the new image underneath
-            std::thread::sleep(Duration::from_millis(180));
+            wait_for_cosmic_bg_commit(target_path, prev_state_mtime, Duration::from_millis(3000));
         }
 
-        // 5. Destroy our temporary overlay surfaces so cosmic-bg owns the static background alone!
+        // 6. Destroy our temporary `Layer::Bottom` surfaces so `cosmic-bg` owns the static background alone
         self.state.destroy_all_output_surfaces();
         self.state.to_wallpaper = None;
         self.state.from_wallpaper = Some(wallpaper);

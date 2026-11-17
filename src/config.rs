@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimeUnit {
@@ -124,7 +124,7 @@ impl Default for SlideshowConfig {
             randomize_interval: true,
             jitter_value: 1.0,
             order_mode: OrderMode::Shuffle,
-            fade_duration_secs: 1.5,
+            fade_duration_secs: 2.5,
             scaling_mode: ScalingMode::Zoom,
             paused: false,
             sync_cosmic_config: true,
@@ -349,6 +349,62 @@ pub fn sync_cosmic_background_file(image_path: &Path, scaling_mode: ScalingMode)
     );
 
     let _ = fs::write(&all_bg_path, ron_content);
+}
+
+/// Returns the path to `cosmic-bg`'s state file (`~/.local/state/cosmic/com.system76.CosmicBackground/v1/wallpapers`),
+/// which `cosmic-bg` updates when it processes a new wallpaper.
+pub fn cosmic_bg_state_wallpapers_path() -> Option<PathBuf> {
+    let state_dir =
+        dirs::state_dir().or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))?;
+    let p = state_dir
+        .join("cosmic")
+        .join("com.system76.CosmicBackground")
+        .join("v1")
+        .join("wallpapers");
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Waits until `cosmic-bg` has finished decoding, Lanczos-scaling, and committing `target_path`
+/// to all outputs underneath our `Layer::Bottom` crossfade surface.
+pub fn wait_for_cosmic_bg_commit(
+    target_path: &Path,
+    previous_mtime: Option<SystemTime>,
+    timeout: Duration,
+) {
+    let Some(state_file) = cosmic_bg_state_wallpapers_path() else {
+        std::thread::sleep(Duration::from_millis(650));
+        return;
+    };
+
+    let target_str = target_path.to_string_lossy();
+    let start = Instant::now();
+
+    while start.elapsed() < timeout {
+        let mtime_changed = match (
+            previous_mtime,
+            fs::metadata(&state_file).and_then(|m| m.modified()).ok(),
+        ) {
+            (Some(prev), Some(curr)) => curr > prev,
+            _ => true,
+        };
+
+        if mtime_changed {
+            if let Ok(content) = fs::read_to_string(&state_file) {
+                if content.contains(target_str.as_ref()) {
+                    // Wait 220ms after cosmic-bg updates its state file so its SHM buffer
+                    // is 100% committed and latched on every output (including USB displays)
+                    // before our Layer::Bottom surface unmaps!
+                    std::thread::sleep(Duration::from_millis(220));
+                    return;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
