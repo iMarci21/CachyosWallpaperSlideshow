@@ -173,7 +173,7 @@ impl SlideshowConfig {
         if self.jitter_value < 0.0 || !self.jitter_value.is_finite() {
             self.jitter_value = 0.0;
         }
-        self.fade_duration_secs = self.fade_duration_secs.clamp(0.1, 10.0);
+        self.fade_duration_secs = self.fade_duration_secs.clamp(0.5, 10.0);
     }
 
     pub fn base_interval_secs(&self) -> f64 {

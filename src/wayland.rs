@@ -527,7 +527,7 @@ impl WaylandRenderer {
         }
 
         // 3. Animate smoothstep crossfade at 60 FPS for the full requested duration (e.g. 2.5s)
-        let duration = Duration::from_secs_f32(fade_duration_secs.clamp(0.05, 10.0));
+        let duration = Duration::from_secs_f32(fade_duration_secs.clamp(0.5, 10.0));
         let frame_step = Duration::from_micros(16_667); // ~60 FPS
         let start = Instant::now();
 

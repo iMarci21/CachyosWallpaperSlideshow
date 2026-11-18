@@ -632,14 +632,14 @@ impl SlideshowApp {
                     ui.label(RichText::new("Smooth Crossfade Duration:").strong());
                     ui.horizontal(|ui| {
                         let f_slider = ui.add(
-                            egui::Slider::new(&mut self.config.fade_duration_secs, 0.1..=5.0)
+                            egui::Slider::new(&mut self.config.fade_duration_secs, 0.5..=5.0)
                                 .step_by(0.1)
                                 .suffix(" s"),
                         );
                         let f_drag = ui.add(
                             egui::DragValue::new(&mut self.config.fade_duration_secs)
                                 .speed(0.1)
-                                .range(0.1..=10.0)
+                                .range(0.5..=10.0)
                                 .suffix(" s"),
                         );
                         if f_slider.changed() || f_drag.changed() {
