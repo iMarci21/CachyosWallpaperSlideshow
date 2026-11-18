@@ -1,6 +1,6 @@
 # CachyOS Wallpaper Slideshow
 
-A native Rust wallpaper slideshow & rotation manager with **60 FPS Wayland Layer-Shell crossfades** (currently broken, only swaps statically, to be fixed soon), built for **CachyOS (COSMIC Desktop & Wayland compositors)**.
+A native Rust wallpaper slideshow & rotation manager with **60 FPS Wayland Layer-Shell crossfades**, built for **CachyOS (COSMIC Desktop & Wayland compositors)**.
 
 ## Why This Exists
 COSMIC Settings' built-in wallpaper rotation only rotates when pointed at a single directory source, and does not crossfade or rotate custom multi-folder image selections. `cachyos-wallpaper-slideshow` provides:
@@ -17,6 +17,8 @@ COSMIC Settings' built-in wallpaper rotation only rotates when pointed at a sing
 cargo run --release
 # or after building:
 ./target/release/cachyos-wallpaper-slideshow
+
+# Once built, one can also launch the GUI from the application launcher (Default keybind: Super) and search for "CachyOS Wallpaper Slideshow"
 ```
 
 ### CLI & Keybinding Controls
