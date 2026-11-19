@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use rand::Rng;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -91,6 +92,8 @@ impl ScalingMode {
 pub struct WallpaperItem {
     pub path: PathBuf,
     pub enabled: bool,
+    #[serde(default)]
+    pub brightness: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,6 +118,7 @@ impl Default for SlideshowConfig {
             wallpapers.push(WallpaperItem {
                 path,
                 enabled: true,
+                brightness: 0,
             });
         }
         Self {
@@ -174,6 +178,18 @@ impl SlideshowConfig {
             self.jitter_value = 0.0;
         }
         self.fade_duration_secs = self.fade_duration_secs.clamp(0.5, 10.0);
+        for w in &mut self.wallpapers {
+            w.brightness = w.brightness.clamp(-100, 100);
+        }
+    }
+
+    pub fn wallpaper_brightness(&self, path: &Path) -> i32 {
+        self.wallpapers
+            .iter()
+            .find(|w| w.path == path)
+            .map(|w| w.brightness)
+            .unwrap_or(0)
+            .clamp(-100, 100)
     }
 
     pub fn base_interval_secs(&self) -> f64 {
@@ -225,6 +241,7 @@ impl SlideshowConfig {
                     self.wallpapers.push(WallpaperItem {
                         path: canonical,
                         enabled: true,
+                        brightness: 0,
                     });
                     added += 1;
                 }
@@ -313,7 +330,7 @@ pub fn discover_cosmic_wallpapers() -> Vec<PathBuf> {
 
     // 2. Check com.system76.CosmicBackground/v1/all
     if let Some(p) = current_cosmic_wallpaper() {
-        if !found.contains(&p) {
+        if !p.starts_with(DaemonState::runtime_dir()) && !found.contains(&p) {
             found.push(p);
         }
     }
@@ -349,6 +366,64 @@ pub fn sync_cosmic_background_file(image_path: &Path, scaling_mode: ScalingMode)
     );
 
     let _ = fs::write(&all_bg_path, ron_content);
+}
+
+/// Creates a 256-byte lookup table for brightness adjustments in the range [-100, 100].
+/// - At -100%: all values are 0 (completely black).
+/// - At 0%: identity mapping (original image).
+/// - At +100%: all values smoothly reach 255 (completely white).
+/// - Symmetric, continuous linear interpolation, matching phone gallery brightness adjustments.
+pub fn create_brightness_lut(brightness: i32) -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    let b = brightness.clamp(-100, 100) as f32 / 100.0;
+    if b < 0.0 {
+        let factor = 1.0 + b; // in [0.0, 1.0]
+        for i in 0..256 {
+            lut[i] = ((i as f32) * factor).round().clamp(0.0, 255.0) as u8;
+        }
+    } else {
+        for i in 0..256 {
+            lut[i] = ((i as f32) + (255.0 - (i as f32)) * b)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+        }
+    }
+    lut
+}
+
+/// Resolves the file path to give to `cosmic-bg`.
+/// If brightness is 0%, returns the original file path directly with zero extra files.
+/// If brightness is not 0%, renders the adjusted image into a tmpfs RAM file in `$XDG_RUNTIME_DIR`.
+/// No edited image files are saved in the user's permanent directories.
+pub fn resolve_wallpaper_for_cosmic(original_path: &Path, brightness: i32) -> Result<PathBuf> {
+    if brightness == 0 {
+        return Ok(original_path.to_path_buf());
+    }
+
+    let runtime_dir = DaemonState::runtime_dir().join("cachyos-wallpaper-slideshow");
+    fs::create_dir_all(&runtime_dir)?;
+    let rendered_path = runtime_dir.join("rendered_wallpaper.png");
+
+    let img = image::open(original_path).with_context(|| {
+        format!(
+            "Failed to open image for brightness adjustment: {}",
+            original_path.display()
+        )
+    })?;
+
+    let lut = create_brightness_lut(brightness);
+    let mut rgba = img.to_rgba8();
+    rgba.par_chunks_exact_mut(4).for_each(|px| {
+        px[0] = lut[px[0] as usize];
+        px[1] = lut[px[1] as usize];
+        px[2] = lut[px[2] as usize];
+    });
+
+    let tmp_path = runtime_dir.join("rendered_wallpaper.png.tmp");
+    rgba.save_with_format(&tmp_path, image::ImageFormat::Png)?;
+    fs::rename(&tmp_path, &rendered_path)?;
+
+    Ok(rendered_path)
 }
 
 /// Returns the path to `cosmic-bg`'s state file (`~/.local/state/cosmic/com.system76.CosmicBackground/v1/wallpapers`),

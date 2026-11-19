@@ -352,6 +352,56 @@ impl SlideshowApp {
                             ui.label(RichText::new("Current:").color(Color32::from_gray(165)));
                             ui.label(RichText::new(curr_name).strong());
                         });
+
+                        // Current wallpaper live brightness slider
+                        if let Some(curr_path) = &state.current_wallpaper {
+                            if let Some(idx) = self
+                                .config
+                                .wallpapers
+                                .iter()
+                                .position(|w| &w.path == curr_path)
+                            {
+                                let mut brightness = self.config.wallpapers[idx].brightness;
+                                let mut brightness_changed = false;
+                                ui.horizontal(|ui| {
+                                    let b_color = if brightness == 0 {
+                                        Color32::from_gray(160)
+                                    } else if brightness > 0 {
+                                        Color32::from_rgb(255, 215, 80)
+                                    } else {
+                                        Color32::from_rgb(100, 165, 240)
+                                    };
+                                    ui.label(
+                                        RichText::new("☀ Brightness:")
+                                            .small()
+                                            .color(b_color)
+                                            .strong(),
+                                    );
+                                    let s_resp = ui.add(
+                                        egui::Slider::new(&mut brightness, -100..=100)
+                                            .suffix("%")
+                                            .show_value(true),
+                                    );
+                                    if s_resp.changed() {
+                                        brightness_changed = true;
+                                    }
+                                    if brightness != 0
+                                        && ui
+                                            .small_button("↺")
+                                            .on_hover_text("Reset to 0%")
+                                            .clicked()
+                                    {
+                                        brightness = 0;
+                                        brightness_changed = true;
+                                    }
+                                });
+                                if brightness_changed {
+                                    self.config.wallpapers[idx].brightness = brightness;
+                                    self.maybe_auto_save();
+                                }
+                            }
+                        }
+
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Up Next:").color(Color32::from_gray(165)));
                             ui.label(RichText::new(next_name).color(Color32::from_gray(205)));
@@ -914,11 +964,17 @@ impl SlideshowApp {
                                                         rect.center(),
                                                         draw_size,
                                                     );
-                                                    let tint = if item.enabled {
-                                                        Color32::WHITE
+
+                                                    // Visual brightness simulation directly on the thumbnail!
+                                                    let base_level = if item.enabled { 255.0 } else { 135.0 };
+                                                    let tint = if item.brightness < 0 {
+                                                        let factor = (1.0 + (item.brightness as f32 / 100.0)).clamp(0.0, 1.0);
+                                                        let val = (base_level * factor).round() as u8;
+                                                        Color32::from_rgb(val, val, val)
                                                     } else {
-                                                        Color32::from_gray(135)
+                                                        Color32::from_rgb(base_level as u8, base_level as u8, base_level as u8)
                                                     };
+
                                                     ui.painter().image(
                                                         texture.id(),
                                                         draw_rect,
@@ -928,6 +984,16 @@ impl SlideshowApp {
                                                         ),
                                                         tint,
                                                     );
+
+                                                    if item.brightness > 0 {
+                                                        let b = (item.brightness as f32 / 100.0).clamp(0.0, 1.0);
+                                                        let alpha = (b * 255.0).round() as u8;
+                                                        ui.painter().rect_filled(
+                                                            draw_rect,
+                                                            CornerRadius::same(6),
+                                                            Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
+                                                        );
+                                                    }
                                                 }
                                             }
                                             Some(ThumbState::Loading) | None => {
@@ -1044,6 +1110,36 @@ impl SlideshowApp {
                                                     }
                                                 },
                                             );
+                                        });
+
+                                        // Brightness adjustment row (-100% to +100%)
+                                        ui.add_space(2.0);
+                                        ui.horizontal(|ui| {
+                                            let b_color = if item.brightness == 0 {
+                                                Color32::from_gray(160)
+                                            } else if item.brightness > 0 {
+                                                Color32::from_rgb(255, 215, 80)
+                                            } else {
+                                                Color32::from_rgb(100, 165, 240)
+                                            };
+                                            ui.label(RichText::new("☀").color(b_color).strong());
+                                            let s_resp = ui.add(
+                                                egui::Slider::new(&mut item.brightness, -100..=100)
+                                                    .suffix("%")
+                                                    .show_value(true),
+                                            );
+                                            if s_resp.changed() {
+                                                any_toggled = true;
+                                            }
+                                            if item.brightness != 0
+                                                && ui
+                                                    .small_button("↺")
+                                                    .on_hover_text("Reset brightness to 0%")
+                                                    .clicked()
+                                            {
+                                                item.brightness = 0;
+                                                any_toggled = true;
+                                            }
                                         });
                                     });
                                 });

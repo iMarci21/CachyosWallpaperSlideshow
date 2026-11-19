@@ -1,6 +1,6 @@
 use crate::config::{
-    current_cosmic_wallpaper, now_unix_ms, sync_cosmic_background_file, DaemonState, IpcCommand,
-    OrderMode, SlideshowConfig,
+    current_cosmic_wallpaper, now_unix_ms, resolve_wallpaper_for_cosmic,
+    sync_cosmic_background_file, DaemonState, IpcCommand, OrderMode, SlideshowConfig,
 };
 use crate::wayland::{DecodedWallpaper, WaylandRenderer};
 use anyhow::{Context, Result};
@@ -270,19 +270,29 @@ fn apply_wallpaper(
     config: &SlideshowConfig,
     fade_secs: f32,
 ) {
+    let brightness = config.wallpaper_brightness(path);
+    let cosmic_path = match resolve_wallpaper_for_cosmic(path, brightness) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("Failed to resolve wallpaper for cosmic: {err:#}");
+            path.to_path_buf()
+        }
+    };
+
     if let Some(wl) = renderer.as_mut() {
         match DecodedWallpaper::load(path) {
             Ok(decoded) => {
                 if let Err(err) = wl.transition_to(
-                    path,
+                    &cosmic_path,
                     decoded,
+                    brightness,
                     config.scaling_mode,
                     fade_secs,
                     config.sync_cosmic_config,
                 ) {
                     eprintln!("Wayland transition error: {err:#}");
                     if config.sync_cosmic_config {
-                        sync_cosmic_background_file(path, config.scaling_mode);
+                        sync_cosmic_background_file(&cosmic_path, config.scaling_mode);
                     }
                 }
             }
@@ -291,7 +301,7 @@ fn apply_wallpaper(
             }
         }
     } else if config.sync_cosmic_config {
-        sync_cosmic_background_file(path, config.scaling_mode);
+        sync_cosmic_background_file(&cosmic_path, config.scaling_mode);
     }
 }
 
@@ -311,16 +321,24 @@ pub fn run_daemon() -> Result<()> {
 
     let mut config = SlideshowConfig::load();
     let existing_cosmic_wp = current_cosmic_wallpaper();
-    let mut renderer =
-        match WaylandRenderer::new(config.scaling_mode, existing_cosmic_wp.as_deref()) {
-            Ok(r) => Some(r),
-            Err(err) => {
-                eprintln!(
-                    "Wayland LayerShell unavailable ({err:#}), falling back to COSMIC config sync"
-                );
-                None
-            }
-        };
+    let initial_brightness = existing_cosmic_wp
+        .as_ref()
+        .map(|p| config.wallpaper_brightness(p))
+        .unwrap_or(0);
+
+    let mut renderer = match WaylandRenderer::new(
+        config.scaling_mode,
+        existing_cosmic_wp.as_deref(),
+        initial_brightness,
+    ) {
+        Ok(r) => Some(r),
+        Err(err) => {
+            eprintln!(
+                "Wayland LayerShell unavailable ({err:#}), falling back to COSMIC config sync"
+            );
+            None
+        }
+    };
 
     let backend_info = if renderer.is_some() {
         "Transient Crossfade + COSMIC Hand-off (Zero Idle Overlay)".to_string()
@@ -343,6 +361,8 @@ pub fn run_daemon() -> Result<()> {
         updated_unix_ms: now_unix_ms(),
     };
 
+    let mut last_applied_brightness = initial_brightness;
+
     // Perform initial wallpaper setup if not paused (or if no existing wallpaper was set)
     if !config.paused || existing_cosmic_wp.is_none() {
         if let Some(first_wp) = playlist.advance_next() {
@@ -351,6 +371,7 @@ pub fn run_daemon() -> Result<()> {
             state.next_wallpaper = playlist.planned_next.clone();
             state.save();
 
+            last_applied_brightness = config.wallpaper_brightness(&first_wp);
             apply_wallpaper(&mut renderer, &first_wp, &config, config.fade_duration_secs);
             state.transitioning = false;
         }
@@ -417,6 +438,7 @@ pub fn run_daemon() -> Result<()> {
                                 state.next_wallpaper = playlist.planned_next.clone();
                                 state.save();
 
+                                last_applied_brightness = config.wallpaper_brightness(&next_wp);
                                 apply_wallpaper(
                                     &mut renderer,
                                     &next_wp,
@@ -440,6 +462,7 @@ pub fn run_daemon() -> Result<()> {
                                 state.next_wallpaper = playlist.planned_next.clone();
                                 state.save();
 
+                                last_applied_brightness = config.wallpaper_brightness(&prev_wp);
                                 apply_wallpaper(
                                     &mut renderer,
                                     &prev_wp,
@@ -464,6 +487,7 @@ pub fn run_daemon() -> Result<()> {
                                 state.next_wallpaper = playlist.planned_next.clone();
                                 state.save();
 
+                                last_applied_brightness = config.wallpaper_brightness(&target_path);
                                 apply_wallpaper(
                                     &mut renderer,
                                     &target_path,
@@ -511,6 +535,13 @@ pub fn run_daemon() -> Result<()> {
                 .map(|c| playlist.enabled.contains(c))
                 .unwrap_or(false);
 
+            let curr_brightness = state
+                .current_wallpaper
+                .as_ref()
+                .map(|p| config.wallpaper_brightness(p))
+                .unwrap_or(0);
+            let brightness_changed = curr_brightness != last_applied_brightness;
+
             if !current_still_enabled && !playlist.enabled.is_empty() {
                 if let Some(next_wp) = playlist.advance_next() {
                     state.transitioning = true;
@@ -518,6 +549,7 @@ pub fn run_daemon() -> Result<()> {
                     state.next_wallpaper = playlist.planned_next.clone();
                     state.save();
 
+                    last_applied_brightness = config.wallpaper_brightness(&next_wp);
                     apply_wallpaper(&mut renderer, &next_wp, &config, config.fade_duration_secs);
                     state.transitioning = false;
                 }
@@ -525,9 +557,10 @@ pub fn run_daemon() -> Result<()> {
                 current_target_duration = config.sample_next_duration();
                 state.cycle_started_unix_ms = now_unix_ms();
                 state.cycle_duration_ms = current_target_duration.as_millis() as u64;
-            } else if scaling_changed {
+            } else if brightness_changed || scaling_changed {
                 if let Some(curr) = state.current_wallpaper.clone() {
-                    sync_cosmic_background_file(&curr, config.scaling_mode);
+                    apply_wallpaper(&mut renderer, &curr, &config, 0.4);
+                    last_applied_brightness = curr_brightness;
                 }
             }
 
@@ -551,6 +584,7 @@ pub fn run_daemon() -> Result<()> {
                 state.next_wallpaper = playlist.planned_next.clone();
                 state.save();
 
+                last_applied_brightness = config.wallpaper_brightness(&next_wp);
                 apply_wallpaper(&mut renderer, &next_wp, &config, config.fade_duration_secs);
                 state.transitioning = false;
             }

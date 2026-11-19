@@ -1,6 +1,6 @@
 use crate::config::{
-    cosmic_bg_state_wallpapers_path, sync_cosmic_background_file, wait_for_cosmic_bg_commit,
-    ScalingMode,
+    cosmic_bg_state_wallpapers_path, create_brightness_lut, sync_cosmic_background_file,
+    wait_for_cosmic_bg_commit, ScalingMode,
 };
 use anyhow::{Context, Result};
 use image::{DynamicImage, GenericImageView, RgbaImage};
@@ -47,8 +47,14 @@ impl DecodedWallpaper {
     }
 
     /// Scales the image into a Wayland `Xrgb8888` (little-endian `[B, G, R, 255]`) byte buffer
-    /// of exact size `width * height * 4`.
-    pub fn scale_to_xrgb8888(&self, target_w: u32, target_h: u32, mode: ScalingMode) -> Vec<u8> {
+    /// of exact size `width * height * 4`, with the specified brightness LUT applied.
+    pub fn scale_to_xrgb8888(
+        &self,
+        target_w: u32,
+        target_h: u32,
+        mode: ScalingMode,
+        brightness: i32,
+    ) -> Vec<u8> {
         let target_w = target_w.max(1);
         let target_h = target_h.max(1);
         let (src_w, src_h) = self.image.dimensions();
@@ -97,15 +103,16 @@ impl DecodedWallpaper {
             }
         };
 
+        let lut = create_brightness_lut(brightness);
         let raw = rgba.into_raw();
         let mut xrgb = vec![0u8; raw.len()];
         xrgb.par_chunks_exact_mut(4)
             .zip(raw.par_chunks_exact(4))
             .for_each(|(dst, src)| {
                 // Wayland WL_SHM_FORMAT_XRGB8888 on little-endian is [B, G, R, X]
-                dst[0] = src[2];
-                dst[1] = src[1];
-                dst[2] = src[0];
+                dst[0] = lut[src[2] as usize];
+                dst[1] = lut[src[1] as usize];
+                dst[2] = lut[src[0] as usize];
                 dst[3] = 255;
             });
         xrgb
@@ -154,14 +161,16 @@ impl OutputSurface {
     fn prepare_buffers(
         &mut self,
         from_wp: &DecodedWallpaper,
+        from_brightness: i32,
         to_wp: &DecodedWallpaper,
+        to_brightness: i32,
         mode: ScalingMode,
     ) {
         if self.width == 0 || self.height == 0 {
             return;
         }
-        self.from_buffer = from_wp.scale_to_xrgb8888(self.width, self.height, mode);
-        self.to_buffer = to_wp.scale_to_xrgb8888(self.width, self.height, mode);
+        self.from_buffer = from_wp.scale_to_xrgb8888(self.width, self.height, mode, from_brightness);
+        self.to_buffer = to_wp.scale_to_xrgb8888(self.width, self.height, mode, to_brightness);
     }
 
     fn draw_frame(&mut self, blend_progress: f32) -> Result<()> {
@@ -213,7 +222,9 @@ pub struct WaylandLayerState {
     layer_shell: LayerShell,
     surfaces: HashMap<u32, OutputSurface>,
     from_wallpaper: Option<DecodedWallpaper>,
+    from_brightness: i32,
     to_wallpaper: Option<DecodedWallpaper>,
+    to_brightness: i32,
     scaling_mode: ScalingMode,
 }
 
@@ -234,11 +245,6 @@ impl WaylandLayerState {
             surface.set_input_region(Some(region.wl_region()));
         }
 
-        // IMPORTANT: Use `Layer::Bottom` instead of `Layer::Background`!
-        // In zwlr_layer_shell_v1, `Layer::Bottom` sits strictly ABOVE `Layer::Background` (`cosmic-bg`)
-        // and strictly BELOW all normal application windows and panels (`Layer::Top`).
-        // This guarantees that when `cosmic-bg` finishes loading/committing on `Layer::Background`,
-        // it can NEVER jump in front of our crossfade animation and cut off a 2.5s fade!
         let layer_surface = self.layer_shell.create_layer_surface(
             qh,
             surface,
@@ -279,9 +285,6 @@ impl WaylandLayerState {
     }
 
     fn destroy_all_output_surfaces(&mut self) {
-        // Dropping `OutputSurface` drops `LayerSurface` and `SlotPool`,
-        // cleanly unmapping and destroying the Wayland layer surfaces so zero
-        // surfaces exist when the slideshow is idle or paused!
         self.surfaces.clear();
     }
 }
@@ -389,7 +392,7 @@ impl LayerShellHandler for WaylandLayerState {
                 surf.height = new_h;
                 surf.configured = true;
                 if let (Some(f_wp), Some(t_wp)) = (from_wp, to_wp) {
-                    surf.prepare_buffers(f_wp, t_wp, mode);
+                    surf.prepare_buffers(f_wp, self.from_brightness, t_wp, self.to_brightness, mode);
                     let _ = surf.draw_frame(0.0);
                 }
                 break;
@@ -424,7 +427,11 @@ pub struct WaylandRenderer {
 }
 
 impl WaylandRenderer {
-    pub fn new(initial_scaling: ScalingMode, initial_wallpaper: Option<&Path>) -> Result<Self> {
+    pub fn new(
+        initial_scaling: ScalingMode,
+        initial_wallpaper: Option<&Path>,
+        initial_brightness: i32,
+    ) -> Result<Self> {
         let conn = Connection::connect_to_env().context("Failed to connect to Wayland display")?;
         let (globals, mut event_queue) =
             registry_queue_init(&conn).context("Failed to initialize Wayland registry")?;
@@ -448,7 +455,9 @@ impl WaylandRenderer {
             layer_shell,
             surfaces: HashMap::new(),
             from_wallpaper,
+            from_brightness: initial_brightness,
             to_wallpaper: None,
+            to_brightness: 0,
             scaling_mode: initial_scaling,
         };
 
@@ -480,6 +489,7 @@ impl WaylandRenderer {
         &mut self,
         target_path: &Path,
         wallpaper: DecodedWallpaper,
+        brightness: i32,
         scaling_mode: ScalingMode,
         fade_duration_secs: f32,
         sync_cosmic: bool,
@@ -493,6 +503,7 @@ impl WaylandRenderer {
                 sync_cosmic_background_file(target_path, scaling_mode);
             }
             self.state.from_wallpaper = Some(wallpaper);
+            self.state.from_brightness = brightness;
             return Ok(());
         };
 
@@ -501,12 +512,14 @@ impl WaylandRenderer {
                 sync_cosmic_background_file(target_path, scaling_mode);
             }
             self.state.from_wallpaper = Some(wallpaper);
+            self.state.from_brightness = brightness;
             return Ok(());
         }
 
         // 1. Create temporary `Layer::Bottom` surfaces and cover `Layer::Background` with frame 0.0
         self.state.from_wallpaper = Some(prev_wp);
         self.state.to_wallpaper = Some(wallpaper.clone());
+        self.state.to_brightness = brightness;
 
         let qh = self.event_queue.handle();
         self.state.spawn_all_output_surfaces(&qh);
@@ -567,6 +580,7 @@ impl WaylandRenderer {
         self.state.destroy_all_output_surfaces();
         self.state.to_wallpaper = None;
         self.state.from_wallpaper = Some(wallpaper);
+        self.state.from_brightness = brightness;
         self.conn.flush()?;
         self.event_queue.roundtrip(&mut self.state)?;
 

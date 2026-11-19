@@ -101,7 +101,7 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{OrderMode, SlideshowConfig, TimeUnit};
+    use crate::config::{create_brightness_lut, OrderMode, SlideshowConfig, TimeUnit};
     use crate::wayland::blend_xrgb8888;
 
     #[test]
@@ -148,5 +148,42 @@ mod tests {
 
         blend_xrgb8888(&from, &to, &mut dst, 0.5);
         assert_eq!(dst, vec![100u8, 100u8, 100u8, 255u8]);
+    }
+
+    #[test]
+    fn test_brightness_lut() {
+        // 0% brightness must be identity
+        let lut_identity = create_brightness_lut(0);
+        for i in 0..256 {
+            assert_eq!(lut_identity[i], i as u8);
+        }
+
+        // -100% brightness must be completely black
+        let lut_black = create_brightness_lut(-100);
+        for &val in &lut_black {
+            assert_eq!(val, 0);
+        }
+
+        // +100% brightness must be completely white
+        let lut_white = create_brightness_lut(100);
+        for &val in &lut_white {
+            assert_eq!(val, 255);
+        }
+
+        // Clamping check
+        assert_eq!(create_brightness_lut(-150), lut_black);
+        assert_eq!(create_brightness_lut(150), lut_white);
+
+        // Monotonicity check for intermediate values
+        for &b in &[-75, -50, -25, 25, 50, 75] {
+            let lut = create_brightness_lut(b);
+            for i in 1..256 {
+                assert!(
+                    lut[i] >= lut[i - 1],
+                    "LUT must be monotonic at brightness {}",
+                    b
+                );
+            }
+        }
     }
 }
