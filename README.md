@@ -7,6 +7,7 @@ COSMIC Settings' built-in wallpaper rotation only rotates when pointed at a sing
 - **Arbitrary Photo Selection**: Load photos from anywhere (`~/Downloads`, `~/Pictures`, or drag-and-drop), toggle individual wallpapers in/out of the active rotation pool, and save your selection.
 - **Silky 60 FPS Smoothstep Crossfades**: Renders directly to `zwlr_layer_shell_v1` (`Layer::Background`) across all monitors using parallel `rayon` pixel blending, while keeping COSMIC's background configuration synced.
 - **Flexible Timing + Randomization (Jitter)**: Set the base switch interval in **Seconds**, **Minutes**, or **Hours** using both a slider and a direct numeric input field, and optionally add a **random time offset (`± variance`)** to each switch so transitions never feel mechanical or uniform.
+- **Customizable Brightness Per Picture**: Every picture's brightness can be manually adjusted (`± 100%`) with linear scaling and persistent configurations across restarts without overwriting or creating copies of the image file.
 - **Shuffle & Sequential Modes**: Switch between a non-repeating random shuffle deck and sequential ordering.
 - **Persistent Background Daemon**: Keeps rotating wallpapers in the background even when the GUI is closed, with one-click `systemd --user` login autostart.
 
