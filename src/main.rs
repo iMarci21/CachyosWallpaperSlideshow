@@ -73,6 +73,9 @@ fn main() -> Result<()> {
             if let Some(state) = DaemonState::load() {
                 println!("Status: Running (PID {})", state.pid);
                 println!("Backend: {}", state.backend_info);
+                if let Some(period) = state.active_period {
+                    println!("Active Period: {} {}", period.icon(), period.as_str());
+                }
                 println!("Paused: {}", state.paused);
                 println!(
                     "Active Rotation Pool: {} wallpapers",
@@ -101,7 +104,10 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::config::{create_brightness_lut, OrderMode, SlideshowConfig, TimeUnit};
+    use crate::config::{
+        create_brightness_lut, format_time_hhmm, OrderMode, SlideshowConfig, TimePeriod, TimeUnit,
+        WallpaperSchedule,
+    };
     use crate::wayland::blend_xrgb8888;
 
     #[test]
@@ -117,6 +123,8 @@ mod tests {
             scaling_mode: crate::config::ScalingMode::Zoom,
             paused: false,
             sync_cosmic_config: false,
+            day_start_minutes: 7 * 60,
+            night_start_minutes: 20 * 60,
         };
 
         let (min_s, max_s) = cfg.interval_bounds_secs();
@@ -185,5 +193,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_day_night_schedule_boundaries_and_matching() {
+        let mut cfg = SlideshowConfig {
+            wallpapers: Vec::new(),
+            day_start_minutes: 7 * 60,    // 07:00
+            night_start_minutes: 20 * 60, // 20:00
+            ..SlideshowConfig::default()
+        };
+
+        assert_eq!(format_time_hhmm(7 * 60), "07:00");
+        assert_eq!(format_time_hhmm(20 * 60 + 5), "20:05");
+
+        // Normal schedule (07:00..20:00 is Day)
+        assert_eq!(cfg.period_for_minutes(0), TimePeriod::Night);
+        assert_eq!(cfg.period_for_minutes(6 * 60 + 59), TimePeriod::Night);
+        assert_eq!(cfg.period_for_minutes(7 * 60), TimePeriod::Day);
+        assert_eq!(cfg.period_for_minutes(12 * 60), TimePeriod::Day);
+        assert_eq!(cfg.period_for_minutes(19 * 60 + 59), TimePeriod::Day);
+        assert_eq!(cfg.period_for_minutes(20 * 60), TimePeriod::Night);
+        assert_eq!(cfg.period_for_minutes(23 * 60 + 59), TimePeriod::Night);
+
+        // Wrapped schedule (e.g., Day starts at 21:00, Night starts at 06:00)
+        cfg.day_start_minutes = 21 * 60;
+        cfg.night_start_minutes = 6 * 60;
+        assert_eq!(cfg.period_for_minutes(22 * 60), TimePeriod::Day);
+        assert_eq!(cfg.period_for_minutes(2 * 60), TimePeriod::Day);
+        assert_eq!(cfg.period_for_minutes(6 * 60), TimePeriod::Night);
+        assert_eq!(cfg.period_for_minutes(15 * 60), TimePeriod::Night);
+        assert_eq!(cfg.period_for_minutes(20 * 60 + 59), TimePeriod::Night);
+        assert_eq!(cfg.period_for_minutes(21 * 60), TimePeriod::Day);
+
+        // WallpaperSchedule matching
+        assert!(WallpaperSchedule::Always.matches_period(TimePeriod::Day));
+        assert!(WallpaperSchedule::Always.matches_period(TimePeriod::Night));
+        assert!(WallpaperSchedule::Day.matches_period(TimePeriod::Day));
+        assert!(!WallpaperSchedule::Day.matches_period(TimePeriod::Night));
+        assert!(!WallpaperSchedule::Night.matches_period(TimePeriod::Day));
+        assert!(WallpaperSchedule::Night.matches_period(TimePeriod::Night));
+
+        // Backward-compatible config deserialization (missing schedule fields default cleanly)
+        let legacy_json = r#"{
+            "wallpapers": [{"path": "/tmp/a.png", "enabled": true, "brightness": -20}],
+            "interval_value": 10.0,
+            "interval_unit": "Minutes",
+            "randomize_interval": false,
+            "jitter_value": 0.0,
+            "order_mode": "Shuffle",
+            "fade_duration_secs": 2.5,
+            "scaling_mode": "Zoom",
+            "paused": false,
+            "sync_cosmic_config": true
+        }"#;
+        let parsed: SlideshowConfig = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(parsed.day_start_minutes, 7 * 60);
+        assert_eq!(parsed.night_start_minutes, 20 * 60);
+        assert_eq!(parsed.wallpapers[0].schedule, WallpaperSchedule::Always);
+        assert_eq!(parsed.wallpapers[0].brightness, -20);
     }
 }

@@ -1,6 +1,7 @@
 use crate::config::{
-    collect_images_from_dir, format_duration_human, is_supported_image, DaemonState, IpcCommand,
-    OrderMode, ScalingMode, SlideshowConfig, TimeUnit,
+    collect_images_from_dir, format_duration_human, format_time_hhmm, is_supported_image,
+    local_time_minutes, DaemonState, IpcCommand, OrderMode, ScalingMode, SlideshowConfig,
+    TimePeriod, TimeUnit, WallpaperSchedule,
 };
 use crate::daemon::{
     is_daemon_running, is_systemd_autostart_enabled, send_ipc_command, set_systemd_autostart,
@@ -14,6 +15,27 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduleFilter {
+    All,
+    ActiveNow,
+    Always,
+    Day,
+    Night,
+}
+
+impl ScheduleFilter {
+    fn label(&self) -> &'static str {
+        match self {
+            ScheduleFilter::All => "All",
+            ScheduleFilter::ActiveNow => "Active Now",
+            ScheduleFilter::Always => "Always",
+            ScheduleFilter::Day => "☀ Day",
+            ScheduleFilter::Night => "🌙 Night",
+        }
+    }
+}
 
 struct ThumbnailResult {
     path: PathBuf,
@@ -42,6 +64,7 @@ pub struct SlideshowApp {
     systemd_autostart: bool,
     search_query: String,
     filter_only_selected: bool,
+    schedule_filter: ScheduleFilter,
     thumbnails: HashMap<PathBuf, ThumbState>,
     thumb_tx: Sender<ThumbnailResult>,
     thumb_rx: Receiver<ThumbnailResult>,
@@ -72,6 +95,7 @@ impl SlideshowApp {
             systemd_autostart: is_systemd_autostart_enabled(),
             search_query: String::new(),
             filter_only_selected: false,
+            schedule_filter: ScheduleFilter::All,
             thumbnails: HashMap::new(),
             thumb_tx,
             thumb_rx,
@@ -116,9 +140,13 @@ impl SlideshowApp {
             let _ = spawn_daemon_background();
         }
         if show_msg {
-            let enabled_count = self.config.enabled_wallpapers().len();
+            let period = self.config.current_time_period();
+            let active_now = self.config.enabled_wallpapers_for_period(period).len();
+            let total_enabled = self.config.enabled_wallpapers().len();
             self.show_toast(format!(
-                "Saved rotation ({enabled_count} wallpapers active)"
+                "Saved ({active_now} active for {} {}, {total_enabled} selected total)",
+                period.icon(),
+                period.as_str()
             ));
         }
     }
@@ -219,6 +247,124 @@ impl SlideshowApp {
         }
     }
 
+    fn render_time_picker(ui: &mut egui::Ui, label: &str, minutes: &mut u16) -> bool {
+        let mut h = (*minutes / 60) % 24;
+        let mut m = *minutes % 60;
+        let mut changed = false;
+
+        ui.horizontal(|ui| {
+            ui.label(label);
+            let h_resp = ui.add(
+                egui::DragValue::new(&mut h)
+                    .range(0..=23)
+                    .speed(0.15)
+                    .custom_formatter(|v, _| format!("{:02}", v.round() as u16)),
+            );
+            ui.label(RichText::new(":").strong());
+            let m_resp = ui.add(
+                egui::DragValue::new(&mut m)
+                    .range(0..=59)
+                    .speed(0.5)
+                    .custom_formatter(|v, _| format!("{:02}", v.round() as u16)),
+            );
+            if h_resp.changed() || m_resp.changed() {
+                *minutes = (h % 24) * 60 + (m % 60);
+                changed = true;
+            }
+        });
+        changed
+    }
+
+    fn paint_day_night_timeline(
+        ui: &mut egui::Ui,
+        day_start: u16,
+        night_start: u16,
+        now_mins: u16,
+    ) {
+        let bar_w = ui.available_width().max(120.0);
+        let bar_h = 14.0_f32;
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(bar_w, bar_h), Sense::hover());
+
+        let painter = ui.painter();
+        let night_col = Color32::from_rgb(40, 52, 102);
+        let day_col = Color32::from_rgb(225, 170, 58);
+
+        // Base Night fill
+        painter.rect_filled(rect, CornerRadius::same(4), night_col);
+
+        // Overlay Day span(s)
+        let d = (day_start % 1440) as f32 / 1440.0;
+        let n = (night_start % 1440) as f32 / 1440.0;
+        if day_start == night_start {
+            painter.rect_filled(rect, CornerRadius::same(4), day_col);
+        } else if d < n {
+            let day_rect = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + d * rect.width(), rect.top()),
+                egui::pos2(rect.left() + n * rect.width(), rect.bottom()),
+            );
+            painter.rect_filled(day_rect, CornerRadius::same(2), day_col);
+        } else {
+            // Wrapped day span: [d..1.0] and [0.0..n]
+            let r1 = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + d * rect.width(), rect.top()),
+                egui::pos2(rect.right(), rect.bottom()),
+            );
+            let r2 = egui::Rect::from_min_max(
+                egui::pos2(rect.left(), rect.top()),
+                egui::pos2(rect.left() + n * rect.width(), rect.bottom()),
+            );
+            painter.rect_filled(r1, CornerRadius::same(2), day_col);
+            painter.rect_filled(r2, CornerRadius::same(2), day_col);
+        }
+
+        // Border around timeline
+        painter.rect_stroke(
+            rect,
+            CornerRadius::same(4),
+            Stroke::new(1.0_f32, Color32::from_rgb(65, 76, 105)),
+            egui::StrokeKind::Inside,
+        );
+
+        // Current time marker needle
+        let now_frac = (now_mins % 1440) as f32 / 1440.0;
+        let now_x = rect.left() + now_frac * rect.width();
+        painter.line_segment(
+            [
+                egui::pos2(now_x, rect.top() - 2.0),
+                egui::pos2(now_x, rect.bottom() + 2.0),
+            ],
+            Stroke::new(2.2_f32, Color32::from_rgb(90, 245, 215)),
+        );
+
+        resp.on_hover_text(format!(
+            "Current time: {}\n☀ Day: {} – {}\n🌙 Night: {} – {}",
+            format_time_hhmm(now_mins),
+            format_time_hhmm(day_start),
+            format_time_hhmm(night_start),
+            format_time_hhmm(night_start),
+            format_time_hhmm(day_start),
+        ));
+
+        // Compact hour axis labels
+        let axis_h = 12.0_f32;
+        let (axis_rect, _) = ui.allocate_exact_size(Vec2::new(bar_w, axis_h), Sense::hover());
+        for (frac, lbl, align) in [
+            (0.0_f32, "00h", egui::Align2::LEFT_TOP),
+            (0.25_f32, "06h", egui::Align2::CENTER_TOP),
+            (0.5_f32, "12h", egui::Align2::CENTER_TOP),
+            (0.75_f32, "18h", egui::Align2::CENTER_TOP),
+            (1.0_f32, "24h", egui::Align2::RIGHT_TOP),
+        ] {
+            ui.painter().text(
+                egui::pos2(axis_rect.left() + frac * axis_rect.width(), axis_rect.top()),
+                align,
+                lbl,
+                FontId::proportional(9.5),
+                Color32::from_gray(135),
+            );
+        }
+    }
+
     fn render_top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.heading(
@@ -251,13 +397,36 @@ impl SlideshowApp {
                     ui.label(RichText::new(badge_text).color(badge_color).strong());
                 });
 
-            if let Some(state) = &self.daemon_state {
-                ui.label(
-                    RichText::new(format!("• {}", state.backend_info))
-                        .small()
-                        .color(Color32::from_gray(165)),
-                );
-            }
+            // Live Day / Night indicator pill
+            let now_mins = local_time_minutes();
+            let period = self.config.period_for_minutes(now_mins);
+            let (p_text, p_fg, p_bg) = match period {
+                TimePeriod::Day => (
+                    format!("☀ Day ({})", format_time_hhmm(now_mins)),
+                    Color32::from_rgb(255, 215, 95),
+                    Color32::from_rgb(48, 40, 22),
+                ),
+                TimePeriod::Night => (
+                    format!("🌙 Night ({})", format_time_hhmm(now_mins)),
+                    Color32::from_rgb(155, 180, 255),
+                    Color32::from_rgb(28, 34, 62),
+                ),
+            };
+            let period_resp = egui::Frame::NONE
+                .fill(p_bg)
+                .corner_radius(CornerRadius::same(12))
+                .inner_margin(egui::Margin::symmetric(10, 4))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(p_text).color(p_fg).strong());
+                })
+                .response;
+            period_resp.on_hover_text(format!(
+                "Day schedule: {} – {}\nNight schedule: {} – {}",
+                format_time_hhmm(self.config.day_start_minutes),
+                format_time_hhmm(self.config.night_start_minutes),
+                format_time_hhmm(self.config.night_start_minutes),
+                format_time_hhmm(self.config.day_start_minutes),
+            ));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let stop_quit_btn = egui::Button::new(
@@ -319,6 +488,9 @@ impl SlideshowApp {
     }
 
     fn render_sidebar(&mut self, ui: &mut egui::Ui) {
+        let now_mins = local_time_minutes();
+        let current_period = self.config.period_for_minutes(now_mins);
+
         egui::ScrollArea::vertical().show(ui, |ui| {
             // 1. Live Playback & Countdown Card
             egui::Frame::group(ui.style())
@@ -420,6 +592,12 @@ impl SlideshowApp {
                             "Crossfading wallpaper now...".to_string()
                         } else if state.paused {
                             "Paused".to_string()
+                        } else if state.active_rotation_count == 0 {
+                            format!(
+                                "No wallpapers scheduled for {} {}",
+                                current_period.icon(),
+                                current_period.as_str()
+                            )
                         } else {
                             format!(
                                 "Next switch in {} (cycle: {})",
@@ -518,7 +696,123 @@ impl SlideshowApp {
 
             ui.add_space(12.0);
 
-            // 2. Time Interval & Randomization Card
+            // 2. Day / Night Schedule Card
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(26, 31, 44))
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("☀/🌙 Day & Night Schedule")
+                                .font(FontId::proportional(16.0))
+                                .strong()
+                                .color(Color32::from_rgb(120, 235, 210)),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Tag photos as Day, Night, or Always. The daemon automatically switches pools at the times below.",
+                        )
+                        .small()
+                        .color(Color32::from_gray(165)),
+                    );
+                    ui.add_space(6.0);
+
+                    let mut schedule_changed = false;
+                    ui.horizontal(|ui| {
+                        if Self::render_time_picker(
+                            ui,
+                            "☀ Day:",
+                            &mut self.config.day_start_minutes,
+                        ) {
+                            schedule_changed = true;
+                        }
+                        ui.add_space(10.0);
+                        if Self::render_time_picker(
+                            ui,
+                            "🌙 Night:",
+                            &mut self.config.night_start_minutes,
+                        ) {
+                            schedule_changed = true;
+                        }
+                    });
+                    if schedule_changed {
+                        self.maybe_auto_save();
+                    }
+
+                    ui.add_space(6.0);
+                    Self::paint_day_night_timeline(
+                        ui,
+                        self.config.day_start_minutes,
+                        self.config.night_start_minutes,
+                        now_mins,
+                    );
+
+                    // Pool breakdown counts
+                    let mut day_only = 0usize;
+                    let mut night_only = 0usize;
+                    let mut always_cnt = 0usize;
+                    for w in &self.config.wallpapers {
+                        if w.enabled {
+                            match w.schedule {
+                                WallpaperSchedule::Always => always_cnt += 1,
+                                WallpaperSchedule::Day => day_only += 1,
+                                WallpaperSchedule::Night => night_only += 1,
+                            }
+                        }
+                    }
+                    let day_pool = day_only + always_cnt;
+                    let night_pool = night_only + always_cnt;
+                    let active_pool = match current_period {
+                        TimePeriod::Day => day_pool,
+                        TimePeriod::Night => night_pool,
+                    };
+
+                    ui.add_space(4.0);
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgb(18, 22, 32))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("☀ Day pool: {day_pool}"))
+                                        .small()
+                                        .color(Color32::from_rgb(245, 200, 90)),
+                                )
+                                .on_hover_text(format!(
+                                    "{day_only} Day-only + {always_cnt} Always"
+                                ));
+                                ui.label(RichText::new("•").small().color(Color32::from_gray(110)));
+                                ui.label(
+                                    RichText::new(format!("🌙 Night pool: {night_pool}"))
+                                        .small()
+                                        .color(Color32::from_rgb(145, 175, 250)),
+                                )
+                                .on_hover_text(format!(
+                                    "{night_only} Night-only + {always_cnt} Always"
+                                ));
+                            });
+                            if active_pool == 0 && (day_only + night_only + always_cnt) > 0 {
+                                ui.add_space(2.0);
+                                ui.label(
+                                    RichText::new(format!(
+                                        "⚠ 0 selected photos match {} {} right now!",
+                                        current_period.icon(),
+                                        current_period.as_str()
+                                    ))
+                                    .small()
+                                    .color(Color32::from_rgb(250, 170, 85)),
+                                );
+                            }
+                        });
+                });
+
+            ui.add_space(12.0);
+
+            // 3. Time Interval & Randomization Card
             egui::Frame::group(ui.style())
                 .fill(Color32::from_rgb(26, 31, 44))
                 .corner_radius(CornerRadius::same(8))
@@ -538,7 +832,6 @@ impl SlideshowApp {
                         for unit in [TimeUnit::Seconds, TimeUnit::Minutes, TimeUnit::Hours] {
                             let selected = self.config.interval_unit == unit;
                             if ui.selectable_label(selected, unit.as_str()).clicked() && !selected {
-                                // Convert current value smoothly or keep sensible defaults
                                 let old_secs = self.config.base_interval_secs();
                                 let old_jitter_secs = self.config.jitter_secs();
                                 self.config.interval_unit = unit;
@@ -653,7 +946,7 @@ impl SlideshowApp {
 
             ui.add_space(12.0);
 
-            // 3. Crossfade & Order Settings Card
+            // 4. Crossfade & Order Settings Card
             egui::Frame::group(ui.style())
                 .fill(Color32::from_rgb(26, 31, 44))
                 .corner_radius(CornerRadius::same(8))
@@ -721,6 +1014,8 @@ impl SlideshowApp {
     }
 
     fn render_gallery(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let current_period = self.config.current_time_period();
+
         // Gallery Toolbar
         ui.horizontal_wrapped(|ui| {
             if ui
@@ -799,6 +1094,41 @@ impl SlideshowApp {
                 self.maybe_auto_save();
             }
 
+            let mut batch_schedule: Option<WallpaperSchedule> = None;
+            ui.menu_button("🕒 Batch Schedule ▾", |ui| {
+                ui.label(
+                    RichText::new("Assign all selected photos to:")
+                        .small()
+                        .color(Color32::from_gray(165)),
+                );
+                if ui.button("Always (Day & Night)").clicked() {
+                    batch_schedule = Some(WallpaperSchedule::Always);
+                    ui.close_menu();
+                }
+                if ui.button("☀ Day Only").clicked() {
+                    batch_schedule = Some(WallpaperSchedule::Day);
+                    ui.close_menu();
+                }
+                if ui.button("🌙 Night Only").clicked() {
+                    batch_schedule = Some(WallpaperSchedule::Night);
+                    ui.close_menu();
+                }
+            });
+            if let Some(sched) = batch_schedule {
+                let mut count = 0usize;
+                for w in &mut self.config.wallpapers {
+                    if w.enabled {
+                        w.schedule = sched;
+                        count += 1;
+                    }
+                }
+                self.maybe_auto_save();
+                self.show_toast(format!(
+                    "Set {count} selected photo(s) to {}",
+                    sched.as_str()
+                ));
+            }
+
             if ui
                 .button(
                     RichText::new("🗑 Remove Unselected").color(Color32::from_rgb(235, 130, 130)),
@@ -821,23 +1151,46 @@ impl SlideshowApp {
         // Filter & Selection Counter Bar
         let total_count = self.config.wallpapers.len();
         let selected_count = self.config.wallpapers.iter().filter(|w| w.enabled).count();
+        let active_now_count = self
+            .config
+            .wallpapers
+            .iter()
+            .filter(|w| w.enabled && w.schedule.matches_period(current_period))
+            .count();
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(format!(
-                    "Rotation Pool: {selected_count} of {total_count} selected"
+                    "Pool: {selected_count}/{total_count} selected  •  {} {} active: {active_now_count}",
+                    current_period.icon(),
+                    current_period.as_str(),
                 ))
                 .strong()
                 .color(Color32::from_rgb(110, 235, 200)),
             );
-            ui.add_space(12.0);
-            ui.checkbox(&mut self.filter_only_selected, "Show only selected");
-            ui.add_space(12.0);
+            ui.add_space(10.0);
+            ui.checkbox(&mut self.filter_only_selected, "Selected only");
+            ui.add_space(10.0);
+
+            for filt in [
+                ScheduleFilter::All,
+                ScheduleFilter::ActiveNow,
+                ScheduleFilter::Always,
+                ScheduleFilter::Day,
+                ScheduleFilter::Night,
+            ] {
+                let sel = self.schedule_filter == filt;
+                if ui.selectable_label(sel, filt.label()).clicked() {
+                    self.schedule_filter = filt;
+                }
+            }
+
+            ui.add_space(10.0);
             ui.label("🔍");
             ui.add(
                 egui::TextEdit::singleline(&mut self.search_query)
-                    .hint_text("Filter by filename or folder...")
-                    .desired_width(220.0),
+                    .hint_text("Filter filename...")
+                    .desired_width(160.0),
             );
             if !self.search_query.is_empty() && ui.small_button("✕").clicked() {
                 self.search_query.clear();
@@ -866,6 +1219,7 @@ impl SlideshowApp {
 
         let query = self.search_query.trim().to_ascii_lowercase();
         let only_sel = self.filter_only_selected;
+        let sched_filter = self.schedule_filter;
 
         let visible_indices: Vec<usize> = self
             .config
@@ -874,6 +1228,18 @@ impl SlideshowApp {
             .enumerate()
             .filter(|(_, item)| {
                 if only_sel && !item.enabled {
+                    return false;
+                }
+                let matches_sched = match sched_filter {
+                    ScheduleFilter::All => true,
+                    ScheduleFilter::ActiveNow => {
+                        item.enabled && item.schedule.matches_period(current_period)
+                    }
+                    ScheduleFilter::Always => item.schedule == WallpaperSchedule::Always,
+                    ScheduleFilter::Day => item.schedule == WallpaperSchedule::Day,
+                    ScheduleFilter::Night => item.schedule == WallpaperSchedule::Night,
+                };
+                if !matches_sched {
                     return false;
                 }
                 if !query.is_empty() {
@@ -886,6 +1252,17 @@ impl SlideshowApp {
             })
             .map(|(i, _)| i)
             .collect();
+
+        if visible_indices.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    RichText::new("No wallpapers match the current filter.")
+                        .font(FontId::proportional(15.0))
+                        .color(Color32::from_gray(155)),
+                );
+            });
+            return;
+        }
 
         // Request thumbnails for visible items
         for &idx in &visible_indices {
@@ -901,7 +1278,7 @@ impl SlideshowApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let avail_w = ui.available_width().max(240.0);
-                let card_w = 235.0_f32;
+                let card_w = 240.0_f32;
                 let spacing = 12.0_f32;
                 let cols = ((avail_w + spacing) / (card_w + spacing)).floor().max(1.0) as usize;
 
@@ -913,11 +1290,19 @@ impl SlideshowApp {
                             let is_active =
                                 current_active_path.as_ref() == Some(&item.path);
                             let file_exists = item.path.is_file();
+                            let matches_now = item.schedule.matches_period(current_period);
 
                             let border_color = if is_active {
                                 Color32::from_rgb(70, 245, 190)
-                            } else if item.enabled {
+                            } else if item.enabled && matches_now {
                                 Color32::from_rgb(45, 145, 125)
+                            } else if item.enabled {
+                                // Enabled in rotation, waiting for the other time period
+                                match item.schedule {
+                                    WallpaperSchedule::Day => Color32::from_rgb(165, 125, 48),
+                                    WallpaperSchedule::Night => Color32::from_rgb(80, 100, 175),
+                                    WallpaperSchedule::Always => Color32::from_rgb(45, 145, 125),
+                                }
                             } else {
                                 Color32::from_rgb(45, 52, 68)
                             };
@@ -939,8 +1324,8 @@ impl SlideshowApp {
                                 .show(ui, |ui| {
                                     ui.set_width(card_w - 16.0);
                                     ui.vertical(|ui| {
-                                        // Thumbnail box (16:9 -> 219 x 123)
-                                        let thumb_size = Vec2::new(card_w - 16.0, 124.0);
+                                        // Thumbnail box (16:9 -> 224 x 126)
+                                        let thumb_size = Vec2::new(card_w - 16.0, 126.0);
                                         let (rect, thumb_resp) =
                                             ui.allocate_exact_size(thumb_size, Sense::click());
 
@@ -965,14 +1350,22 @@ impl SlideshowApp {
                                                         draw_size,
                                                     );
 
-                                                    // Visual brightness simulation directly on the thumbnail!
-                                                    let base_level = if item.enabled { 255.0 } else { 135.0 };
+                                                    // Visual brightness simulation directly on the thumbnail
+                                                    let base_level =
+                                                        if item.enabled { 255.0 } else { 135.0 };
                                                     let tint = if item.brightness < 0 {
-                                                        let factor = (1.0 + (item.brightness as f32 / 100.0)).clamp(0.0, 1.0);
-                                                        let val = (base_level * factor).round() as u8;
+                                                        let factor = (1.0
+                                                            + (item.brightness as f32 / 100.0))
+                                                            .clamp(0.0, 1.0);
+                                                        let val =
+                                                            (base_level * factor).round() as u8;
                                                         Color32::from_rgb(val, val, val)
                                                     } else {
-                                                        Color32::from_rgb(base_level as u8, base_level as u8, base_level as u8)
+                                                        Color32::from_rgb(
+                                                            base_level as u8,
+                                                            base_level as u8,
+                                                            base_level as u8,
+                                                        )
                                                     };
 
                                                     ui.painter().image(
@@ -986,12 +1379,15 @@ impl SlideshowApp {
                                                     );
 
                                                     if item.brightness > 0 {
-                                                        let b = (item.brightness as f32 / 100.0).clamp(0.0, 1.0);
+                                                        let b = (item.brightness as f32 / 100.0)
+                                                            .clamp(0.0, 1.0);
                                                         let alpha = (b * 255.0).round() as u8;
                                                         ui.painter().rect_filled(
                                                             draw_rect,
                                                             CornerRadius::same(6),
-                                                            Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
+                                                            Color32::from_rgba_unmultiplied(
+                                                                255, 255, 255, alpha,
+                                                            ),
                                                         );
                                                     }
                                                 }
@@ -1020,7 +1416,7 @@ impl SlideshowApp {
                                             }
                                         }
 
-                                        // Active badge overlay
+                                        // Active badge overlay (top-left)
                                         if is_active {
                                             let badge_rect = egui::Rect::from_min_size(
                                                 rect.min + Vec2::new(6.0, 6.0),
@@ -1038,6 +1434,59 @@ impl SlideshowApp {
                                                 FontId::proportional(10.5),
                                                 Color32::from_rgb(10, 15, 18),
                                             );
+                                        }
+
+                                        // Schedule corner badge overlay (top-right) for Day / Night
+                                        match item.schedule {
+                                            WallpaperSchedule::Day => {
+                                                let b_size = Vec2::new(56.0, 20.0);
+                                                let badge_rect = egui::Rect::from_min_size(
+                                                    egui::pos2(
+                                                        rect.right() - b_size.x - 6.0,
+                                                        rect.top() + 6.0,
+                                                    ),
+                                                    b_size,
+                                                );
+                                                ui.painter().rect_filled(
+                                                    badge_rect,
+                                                    CornerRadius::same(4),
+                                                    Color32::from_rgba_unmultiplied(
+                                                        230, 175, 50, 230,
+                                                    ),
+                                                );
+                                                ui.painter().text(
+                                                    badge_rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    "☀ DAY",
+                                                    FontId::proportional(10.0),
+                                                    Color32::from_rgb(20, 15, 5),
+                                                );
+                                            }
+                                            WallpaperSchedule::Night => {
+                                                let b_size = Vec2::new(66.0, 20.0);
+                                                let badge_rect = egui::Rect::from_min_size(
+                                                    egui::pos2(
+                                                        rect.right() - b_size.x - 6.0,
+                                                        rect.top() + 6.0,
+                                                    ),
+                                                    b_size,
+                                                );
+                                                ui.painter().rect_filled(
+                                                    badge_rect,
+                                                    CornerRadius::same(4),
+                                                    Color32::from_rgba_unmultiplied(
+                                                        70, 92, 185, 235,
+                                                    ),
+                                                );
+                                                ui.painter().text(
+                                                    badge_rect.center(),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    "🌙 NIGHT",
+                                                    FontId::proportional(10.0),
+                                                    Color32::from_rgb(235, 240, 255),
+                                                );
+                                            }
+                                            WallpaperSchedule::Always => {}
                                         }
 
                                         // Clicking thumbnail toggles selection in rotation
@@ -1112,8 +1561,72 @@ impl SlideshowApp {
                                             );
                                         });
 
+                                        // Day / Night / Always 3-way schedule selector
+                                        ui.add_space(3.0);
+                                        ui.horizontal(|ui| {
+                                            let btn_w = ((card_w - 16.0) - 8.0) / 3.0;
+                                            for (sched, label, active_bg, active_fg) in [
+                                                (
+                                                    WallpaperSchedule::Always,
+                                                    "Always",
+                                                    Color32::from_rgb(0, 145, 120),
+                                                    Color32::from_rgb(240, 255, 250),
+                                                ),
+                                                (
+                                                    WallpaperSchedule::Day,
+                                                    "☀ Day",
+                                                    Color32::from_rgb(185, 135, 32),
+                                                    Color32::from_rgb(255, 250, 230),
+                                                ),
+                                                (
+                                                    WallpaperSchedule::Night,
+                                                    "🌙 Night",
+                                                    Color32::from_rgb(65, 85, 175),
+                                                    Color32::from_rgb(235, 242, 255),
+                                                ),
+                                            ] {
+                                                let is_sel = item.schedule == sched;
+                                                let btn = egui::Button::new(
+                                                    RichText::new(label)
+                                                        .small()
+                                                        .strong()
+                                                        .color(if is_sel {
+                                                            active_fg
+                                                        } else {
+                                                            Color32::from_gray(155)
+                                                        }),
+                                                )
+                                                .fill(if is_sel {
+                                                    active_bg
+                                                } else {
+                                                    Color32::from_rgb(22, 27, 38)
+                                                })
+                                                .corner_radius(CornerRadius::same(5));
+
+                                                if ui
+                                                    .add_sized([btn_w, 20.0], btn)
+                                                    .on_hover_text(match sched {
+                                                        WallpaperSchedule::Always => {
+                                                            "Show during both Day and Night"
+                                                        }
+                                                        WallpaperSchedule::Day => {
+                                                            "Show only during Day hours"
+                                                        }
+                                                        WallpaperSchedule::Night => {
+                                                            "Show only during Night hours"
+                                                        }
+                                                    })
+                                                    .clicked()
+                                                    && !is_sel
+                                                {
+                                                    item.schedule = sched;
+                                                    any_toggled = true;
+                                                }
+                                            }
+                                        });
+
                                         // Brightness adjustment row (-100% to +100%)
-                                        ui.add_space(2.0);
+                                        ui.add_space(3.0);
                                         ui.horizontal(|ui| {
                                             let b_color = if item.brightness == 0 {
                                                 Color32::from_gray(160)
@@ -1192,8 +1705,8 @@ impl eframe::App for SlideshowApp {
 
         egui::SidePanel::left("controls_sidebar")
             .resizable(true)
-            .default_width(350.0)
-            .width_range(310.0..=440.0)
+            .default_width(355.0)
+            .width_range(315.0..=440.0)
             .frame(
                 egui::Frame::NONE
                     .fill(Color32::from_rgb(20, 24, 34))
@@ -1222,8 +1735,8 @@ pub fn run_gui() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("CachyOS Wallpaper Slideshow")
-            .with_inner_size([1160.0, 740.0])
-            .with_min_inner_size([820.0, 520.0])
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([840.0, 540.0])
             .with_app_id("cachyos-wallpaper-slideshow"),
         ..Default::default()
     };

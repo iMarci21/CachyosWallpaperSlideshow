@@ -88,12 +88,62 @@ impl ScalingMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimePeriod {
+    Day,
+    Night,
+}
+
+impl TimePeriod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TimePeriod::Day => "Day",
+            TimePeriod::Night => "Night",
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            TimePeriod::Day => "☀",
+            TimePeriod::Night => "🌙",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum WallpaperSchedule {
+    #[default]
+    Always,
+    Day,
+    Night,
+}
+
+impl WallpaperSchedule {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WallpaperSchedule::Always => "Always",
+            WallpaperSchedule::Day => "Day",
+            WallpaperSchedule::Night => "Night",
+        }
+    }
+
+    pub fn matches_period(&self, period: TimePeriod) -> bool {
+        match self {
+            WallpaperSchedule::Always => true,
+            WallpaperSchedule::Day => period == TimePeriod::Day,
+            WallpaperSchedule::Night => period == TimePeriod::Night,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WallpaperItem {
     pub path: PathBuf,
     pub enabled: bool,
     #[serde(default)]
     pub brightness: i32,
+    #[serde(default)]
+    pub schedule: WallpaperSchedule,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -109,6 +159,10 @@ pub struct SlideshowConfig {
     pub scaling_mode: ScalingMode,
     pub paused: bool,
     pub sync_cosmic_config: bool,
+    /// Local time in minutes from midnight when Day starts (default: 07:00 = 420)
+    pub day_start_minutes: u16,
+    /// Local time in minutes from midnight when Night starts (default: 20:00 = 1200)
+    pub night_start_minutes: u16,
 }
 
 impl Default for SlideshowConfig {
@@ -119,6 +173,7 @@ impl Default for SlideshowConfig {
                 path,
                 enabled: true,
                 brightness: 0,
+                schedule: WallpaperSchedule::Always,
             });
         }
         Self {
@@ -132,6 +187,8 @@ impl Default for SlideshowConfig {
             scaling_mode: ScalingMode::Zoom,
             paused: false,
             sync_cosmic_config: true,
+            day_start_minutes: 7 * 60,
+            night_start_minutes: 20 * 60,
         }
     }
 }
@@ -178,9 +235,35 @@ impl SlideshowConfig {
             self.jitter_value = 0.0;
         }
         self.fade_duration_secs = self.fade_duration_secs.clamp(0.5, 10.0);
+        self.day_start_minutes %= 1440;
+        self.night_start_minutes %= 1440;
         for w in &mut self.wallpapers {
             w.brightness = w.brightness.clamp(-100, 100);
         }
+    }
+
+    pub fn period_for_minutes(&self, now_minutes: u16) -> TimePeriod {
+        let now = now_minutes % 1440;
+        let day = self.day_start_minutes % 1440;
+        let night = self.night_start_minutes % 1440;
+        if day == night {
+            return TimePeriod::Day;
+        }
+        if day < night {
+            if now >= day && now < night {
+                TimePeriod::Day
+            } else {
+                TimePeriod::Night
+            }
+        } else if now >= day || now < night {
+            TimePeriod::Day
+        } else {
+            TimePeriod::Night
+        }
+    }
+
+    pub fn current_time_period(&self) -> TimePeriod {
+        self.period_for_minutes(local_time_minutes())
     }
 
     pub fn wallpaper_brightness(&self, path: &Path) -> i32 {
@@ -231,6 +314,14 @@ impl SlideshowConfig {
             .collect()
     }
 
+    pub fn enabled_wallpapers_for_period(&self, period: TimePeriod) -> Vec<PathBuf> {
+        self.wallpapers
+            .iter()
+            .filter(|w| w.enabled && w.schedule.matches_period(period) && w.path.is_file())
+            .map(|w| w.path.clone())
+            .collect()
+    }
+
     pub fn add_paths<I: IntoIterator<Item = PathBuf>>(&mut self, paths: I) -> usize {
         let existing: HashSet<PathBuf> = self.wallpapers.iter().map(|w| w.path.clone()).collect();
         let mut added = 0;
@@ -242,6 +333,7 @@ impl SlideshowConfig {
                         path: canonical,
                         enabled: true,
                         brightness: 0,
+                        schedule: WallpaperSchedule::Always,
                     });
                     added += 1;
                 }
@@ -254,6 +346,30 @@ impl SlideshowConfig {
         let cosmic_paths = discover_cosmic_wallpapers();
         self.add_paths(cosmic_paths)
     }
+}
+
+/// Returns the current local time of day as minutes since midnight (0..1440),
+/// honoring the system timezone and DST via POSIX `localtime_r`.
+pub fn local_time_minutes() -> u16 {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let res = unsafe { libc::localtime_r(&now_secs, &mut tm) };
+    if !res.is_null() {
+        let hours = tm.tm_hour.clamp(0, 23) as u16;
+        let mins = tm.tm_min.clamp(0, 59) as u16;
+        hours * 60 + mins
+    } else {
+        ((now_secs / 60).rem_euclid(1440)) as u16
+    }
+}
+
+pub fn format_time_hhmm(minutes: u16) -> String {
+    let m = minutes % 1440;
+    format!("{:02}:{:02}", m / 60, m % 60)
 }
 
 pub fn is_supported_image(path: &Path) -> bool {
@@ -502,6 +618,8 @@ pub struct DaemonState {
     pub cycle_started_unix_ms: u64,
     pub cycle_duration_ms: u64,
     pub active_rotation_count: usize,
+    #[serde(default)]
+    pub active_period: Option<TimePeriod>,
     pub transitioning: bool,
     pub backend_info: String,
     pub updated_unix_ms: u64,

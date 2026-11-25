@@ -1,6 +1,6 @@
 use crate::config::{
     current_cosmic_wallpaper, now_unix_ms, resolve_wallpaper_for_cosmic,
-    sync_cosmic_background_file, DaemonState, IpcCommand, OrderMode, SlideshowConfig,
+    sync_cosmic_background_file, DaemonState, IpcCommand, OrderMode, SlideshowConfig, TimePeriod,
 };
 use crate::wayland::{DecodedWallpaper, WaylandRenderer};
 use anyhow::{Context, Result};
@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 struct RotationPlaylist {
     enabled: Vec<PathBuf>,
     order_mode: OrderMode,
+    active_period: TimePeriod,
     seq_index: usize,
     shuffle_bag: Vec<PathBuf>,
     history: Vec<PathBuf>,
@@ -23,27 +24,30 @@ struct RotationPlaylist {
 }
 
 impl RotationPlaylist {
-    fn new(config: &SlideshowConfig) -> Self {
+    fn new(config: &SlideshowConfig, period: TimePeriod) -> Self {
         let mut p = Self {
             enabled: Vec::new(),
             order_mode: config.order_mode,
+            active_period: period,
             seq_index: 0,
             shuffle_bag: Vec::new(),
             history: Vec::new(),
             current: None,
             planned_next: None,
         };
-        p.rebuild(config);
+        p.rebuild(config, period);
         p
     }
 
-    fn rebuild(&mut self, config: &SlideshowConfig) {
-        let new_enabled = config.enabled_wallpapers();
+    fn rebuild(&mut self, config: &SlideshowConfig, period: TimePeriod) {
+        let new_enabled = config.enabled_wallpapers_for_period(period);
         let mode_changed = self.order_mode != config.order_mode;
+        let period_changed = self.active_period != period;
         let list_changed = self.enabled != new_enabled;
 
         self.enabled = new_enabled;
         self.order_mode = config.order_mode;
+        self.active_period = period;
 
         if self.enabled.is_empty() {
             self.shuffle_bag.clear();
@@ -51,7 +55,7 @@ impl RotationPlaylist {
             return;
         }
 
-        if list_changed || mode_changed {
+        if list_changed || mode_changed || period_changed {
             self.shuffle_bag.clear();
             if let Some(curr) = &self.current {
                 if let Some(pos) = self.enabled.iter().position(|p| p == curr) {
@@ -320,6 +324,7 @@ pub fn run_daemon() -> Result<()> {
     listener.set_nonblocking(true)?;
 
     let mut config = SlideshowConfig::load();
+    let mut active_period = config.current_time_period();
     let existing_cosmic_wp = current_cosmic_wallpaper();
     let initial_brightness = existing_cosmic_wp
         .as_ref()
@@ -346,7 +351,7 @@ pub fn run_daemon() -> Result<()> {
         "COSMIC Config Sync".to_string()
     };
 
-    let mut playlist = RotationPlaylist::new(&config);
+    let mut playlist = RotationPlaylist::new(&config, active_period);
     let mut state = DaemonState {
         pid: std::process::id(),
         running: true,
@@ -356,6 +361,7 @@ pub fn run_daemon() -> Result<()> {
         cycle_started_unix_ms: now_unix_ms(),
         cycle_duration_ms: 0,
         active_rotation_count: playlist.enabled.len(),
+        active_period: Some(active_period),
         transitioning: false,
         backend_info,
         updated_unix_ms: now_unix_ms(),
@@ -389,6 +395,7 @@ pub fn run_daemon() -> Result<()> {
     let mut last_config_mtime = fs::metadata(SlideshowConfig::config_path())
         .and_then(|m| m.modified())
         .ok();
+    let mut last_period_check = Instant::now();
 
     loop {
         if let Some(wl) = renderer.as_mut() {
@@ -523,12 +530,15 @@ pub fn run_daemon() -> Result<()> {
             let scaling_changed = new_cfg.scaling_mode != config.scaling_mode;
 
             config = new_cfg;
-            playlist.rebuild(&config);
+            active_period = config.current_time_period();
+            playlist.rebuild(&config, active_period);
             state.paused = config.paused;
+            state.active_period = Some(active_period);
             state.active_rotation_count = playlist.enabled.len();
             state.next_wallpaper = playlist.planned_next.clone();
 
-            // If current wallpaper was unselected or removed, switch immediately to an enabled one
+            // If current wallpaper was unselected, removed, or no longer matches Day/Night period,
+            // switch immediately to an eligible wallpaper.
             let current_still_enabled = state
                 .current_wallpaper
                 .as_ref()
@@ -571,6 +581,49 @@ pub fn run_daemon() -> Result<()> {
                 state.cycle_duration_ms = current_target_duration.as_millis() as u64;
             }
             state.save();
+        }
+
+        // Check every second if local clock crossed between Day and Night
+        if last_period_check.elapsed() >= Duration::from_secs(1) {
+            last_period_check = Instant::now();
+            let now_period = config.current_time_period();
+            if now_period != active_period {
+                active_period = now_period;
+                playlist.rebuild(&config, active_period);
+                state.active_period = Some(active_period);
+                state.active_rotation_count = playlist.enabled.len();
+                state.next_wallpaper = playlist.planned_next.clone();
+
+                let current_matches_new_period = state
+                    .current_wallpaper
+                    .as_ref()
+                    .map(|c| playlist.enabled.contains(c))
+                    .unwrap_or(false);
+
+                // Smoothly switch right away if the current wallpaper belonged exclusively to the previous period
+                if !config.paused && !current_matches_new_period && !playlist.enabled.is_empty() {
+                    if let Some(next_wp) = playlist.advance_next() {
+                        state.transitioning = true;
+                        state.current_wallpaper = Some(next_wp.clone());
+                        state.next_wallpaper = playlist.planned_next.clone();
+                        state.save();
+
+                        last_applied_brightness = config.wallpaper_brightness(&next_wp);
+                        apply_wallpaper(
+                            &mut renderer,
+                            &next_wp,
+                            &config,
+                            config.fade_duration_secs,
+                        );
+                        state.transitioning = false;
+                    }
+                    cycle_start = Instant::now();
+                    current_target_duration = config.sample_next_duration();
+                    state.cycle_started_unix_ms = now_unix_ms();
+                    state.cycle_duration_ms = current_target_duration.as_millis() as u64;
+                }
+                state.save();
+            }
         }
 
         // Check rotation timer
