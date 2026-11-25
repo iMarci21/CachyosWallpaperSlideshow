@@ -26,6 +26,7 @@ image = { version = "0.25", default-features = false, features = [
     "tiff",
     "pnm",
 ] }
+libc = "0.2"
 rand = "0.8"
 rayon = "1.10"
 rfd = "0.15"
